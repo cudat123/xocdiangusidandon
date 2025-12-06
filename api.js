@@ -1,9 +1,3 @@
-// ===================== FULL XOCDIA AI - RENDER READY =====================
-// - Không require file ngoài
-// - Dùng process.env.PORT để chạy trên Render
-// - Chỗ dán cau.txt FULL đã chừa sẵn
-// ========================================================================
-
 const express = require('express');
 const axios = require('axios');
 const cors = require('cors');
@@ -13,8 +7,6 @@ const path = require('path');
 const app = express();
 app.use(cors());
 app.use(express.json());
-
-// ===================== CONFIG =====================
 const PORT = process.env.PORT || 3000;
 const API_URL = 'https://taixiu.system32-cloudfare-356783752985678522.monster/api/luckydice/GetSoiCau';
 
@@ -8365,3 +8357,4 @@ app.get('/api/xocdia', async (req, res) => {
 app.listen(PORT, () =>
   console.log(`🔥 XocDia AI đang chạy trên PORT ${PORT}`)
 );
+
