@@ -8335,7 +8335,7 @@ async function loadHistory() {
 // =================================================================================
 // API CHÍNH /xocdia88 (CẬP NHẬT: LOẠI BỎ D-PREDICT VÀ ĐẶT CẦU LÀM DỰ ĐOÁN CHÍNH)
 // =================================================================================
-app.get("/xocdia88", async (req, res) => {
+app.get("/api/vualo88", async (req, res) => {
   const apiData = await fetchData();
   if (!apiData.length) return res.json({ error: "Không lấy được dữ liệu API" });
 
@@ -8398,7 +8398,7 @@ app.get("/xocdia88", async (req, res) => {
 // =================================================================================
 // API /his – xem toàn bộ lịch sử (GIỮ NGUYÊN CẤU TRÚC)
 // =================================================================================
-app.get("/his", async (req, res) => {
+app.get("/api/his", async (req, res) => {
   try {
     const his = await loadHistory();
     res.json({
