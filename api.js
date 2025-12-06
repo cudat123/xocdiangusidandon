@@ -1,6 +1,4 @@
-// ===================== FULL XOCDIA AI - RENDER READY =====================
-// Gồm: AI phân tích, cau.txt, lưu lịch sử, API /api/his
-// ========================================================================
+// ===================== FULL XOCDIA AI - PATTERN + CAU.TXT + HIS =====================
 
 const express = require("express");
 const axios = require("axios");
@@ -18,11 +16,19 @@ const API_URL =
   "https://taixiu.system32-cloudfare-356783752985678522.monster/api/luckydice/GetSoiCau";
 
 const CACHE_FILE = path.join(__dirname, "history_cache.json");
+const HIS_DIR = path.join(__dirname, "his");
+const HIS_FILE = path.join(HIS_DIR, "history.json");
 
-// ===================== HELPERS =====================
-function nowISO() {
-  return new Date().toISOString();
+// ===================== INIT HISTORY =====================
+async function initHistory() {
+  await fs.ensureDir(HIS_DIR);
+  if (!(await fs.pathExists(HIS_FILE))) {
+    await fs.writeJson(HIS_FILE, []);
+  }
 }
+initHistory();
+
+// ===================== SAFE GET =====================
 function safeGet(o, k, d = null) {
   try {
     return o[k] ?? d;
@@ -41,7 +47,7 @@ async function fetchHistory(limit = 60) {
       await fs.writeJson(CACHE_FILE, { ts: Date.now(), data });
     }
     return data;
-  } catch (err) {
+  } catch {
     try {
       const c = await fs.readJson(CACHE_FILE);
       return c.data || [];
@@ -57,7 +63,6 @@ function normalize(history) {
     const s = Number(safeGet(item, "SecondDice", 0));
     const t = Number(safeGet(item, "ThirdDice", 0));
     const sum = Number(safeGet(item, "DiceSum", f + s + t));
-
     let side = safeGet(item, "BetSide", sum >= 11 ? 0 : 1);
 
     return {
@@ -66,29 +71,30 @@ function normalize(history) {
       SecondDice: s,
       ThirdDice: t,
       DiceSum: sum,
-      BetSide: Number(side),
-      CreatedDate: safeGet(item, "CreatedDate", nowISO()),
+      BetSide: Number(side)
     };
   });
 }
 
-// ===================== LOGIC CŨ =====================
-function logic1(h) {
-  return h[0].BetSide === 0 ? "TÀI" : "XỈU";
+// ===================== LƯU LỊCH SỬ =====================
+async function saveHistory(item) {
+  try {
+    let his = [];
+
+    if (await fs.pathExists(HIS_FILE)) {
+      his = await fs.readJson(HIS_FILE);
+    }
+
+    if (!his.find((x) => x.SessionId === item.SessionId)) {
+      his.unshift(item);
+      await fs.writeJson(HIS_FILE, his);
+    }
+  } catch (e) {
+    console.log("Lỗi lưu lịch sử:", e);
+  }
 }
-function logic2(h) {
-  return h[0].BetSide === 0 ? "XỈU" : "TÀI";
-}
 
-const ALL_LOGICS = { logic1, logic2 };
-
-// ===================== PATTERN MẶC ĐỊNH =====================
-const PATTERN_RULES = {
-  TTTTTTTTTT: { predict: "TÀI", type: "Bệt Tài" },
-  XXXXXXXXXX: { predict: "XỈU", type: "Bệt Xỉu" },
-};
-
-// ===================== DÁN FULL cau.txt VÀO ĐÂY =====================
+// ===================== DÁN CẦU.TXT VÀO ĐÂY =====================
 const RAW_PATTERN_DATA = `
 TTTTTTTTTTTTT => Dự đoán: T - Loại cầu: Cầu bệt (liên tiếp giống nhau)
 TTTTTTTTTTTTX => Dự đoán: T - Loại cầu: Cầu 3-1 (3 bên này - 1 bên kia)
@@ -8283,39 +8289,46 @@ XXXXXXXXXXXTX => Dự đoán: T - Loại cầu: Cầu kẹp (kẹp giữa T ho�
 XXXXXXXXXXXXT => Dự đoán: X - Loại cầu: Cầu 3-1 (3 bên này - 1 bên kia)
 XXXXXXXXXXXXX => Dự đoán: X - Loại cầu: Cầu bệt (liên tiếp giống nhau)
 `; 
-let EXTRA_PATTERNS = {};
 
-(function parseCau() {
-  const lines = RAW_PATTERN_DATA.split(/\r?\n/)
-    .map((x) => x.trim())
-    .filter(Boolean);
+// Parse cau.txt
+let PATTERN_MAP = {};
 
-  for (const ln of lines) {
-    const m = ln.match(/^([TX]+).*Dự đoán:\s*([TX])/i);
+(function parseCau(){
+  const lines = RAW_PATTERN_DATA.split(/\r?\n/).map(l => l.trim()).filter(l => l && !l.startsWith("//"));
+
+  lines.forEach(line => {
+    const m = line.match(/^([TX]+).*Dự đoán:\s*([TX])/i);
     if (m) {
-      const key = m[1].toUpperCase();
-      const val = m[2].toUpperCase() === "T" ? "TÀI" : "XỈU";
-      EXTRA_PATTERNS[key] = val;
+      PATTERN_MAP[m[1].trim()] = m[2].toUpperCase() === "T" ? "Tài" : "Xỉu";
     }
-  }
+  });
 
-  console.log("[+] Loaded patterns:", Object.keys(EXTRA_PATTERNS).length);
+  console.log("Đã nạp", Object.keys(PATTERN_MAP).length, "mẫu cầu txt!");
 })();
-function matchPattern(seq) {
-  if (PATTERN_RULES[seq]) return PATTERN_RULES[seq];
 
-  for (const k of Object.keys(EXTRA_PATTERNS)) {
-    if (seq.endsWith(k)) {
-      return { predict: EXTRA_PATTERNS[k], type: "Cau.txt" };
+// ===================== CHECK PATTERN =====================
+function matchPattern(seq) {
+  for (const key of Object.keys(PATTERN_MAP)) {
+    if (seq.endsWith(key)) {
+      return PATTERN_MAP[key];
     }
   }
   return null;
 }
+
+// ===================== LOGIC AI =====================
+function logic1(h) {
+  return h[0].BetSide === 0 ? "TÀI" : "XỈU";
+}
+function logic2(h) {
+  return h[0].BetSide === 0 ? "XỈU" : "TÀI";
+}
+const LOGICS = { logic1, logic2 };
+
 function AkiraPredict(history) {
   try {
     const last = history[0];
     const prev = history[1];
-
     let point = 0;
 
     point += (last.DiceSum - 10) * 0.7;
@@ -8325,100 +8338,86 @@ function AkiraPredict(history) {
 
     if (prev && last.BetSide === prev.BetSide) point -= 0.6;
 
-    return point >= 0 ? "TÀI" : "XỈU";
+    return point >= 0 ? "Tài" : "Xỉu";
   } catch {
-    return "TÀI";
+    return "Tài";
   }
 }
+
 function voting(history) {
   let tai = 0,
     xiu = 0;
 
-  Object.values(ALL_LOGICS).forEach((fn) => {
+  Object.values(LOGICS).forEach((fn) => {
     const r = fn(history);
     if (r === "TÀI") tai++;
     else xiu++;
   });
 
   const ak = AkiraPredict(history);
-  if (ak === "TÀI") tai += 1.5;
+  if (ak === "Tài") tai += 1.5;
   else xiu += 1.5;
 
-  return tai >= xiu ? "TÀI" : "XỈU";
-}
-
-// ===================== LƯU LỊCH SỬ =====================
-const HIS_DIR = path.join(__dirname, "his");
-const HIS_FILE = path.join(HIS_DIR, "history.json");
-
-async function initHistory() {
-  await fs.ensureDir(HIS_DIR);
-  if (!(await fs.pathExists(HIS_FILE))) {
-    await fs.writeJson(HIS_FILE, []);
-  }
-}
-initHistory();
-
-async function saveHistory(item) {
-  try {
-    let his = [];
-    if (await fs.pathExists(HIS_FILE)) {
-      his = await fs.readJson(HIS_FILE);
-    }
-    if (!his.find((x) => x.SessionId === item.SessionId)) {
-      his.unshift(item);
-      await fs.writeJson(HIS_FILE, his);
-    }
-  } catch (e) {
-    console.log("Lỗi lưu lịch sử:", e);
-  }
+  return tai >= xiu ? "Tài" : "Xỉu";
 }
 
 // ===================== API CHÍNH =====================
-app.get("/api/dcumay", async (req, res) => {
+app.get("/api/ditmemay", async (req, res) => {
   const raw = await fetchHistory();
   if (!raw.length)
     return res.json({ error: "API nguồn lỗi hoặc không có dữ liệu" });
 
   const hist = normalize(raw);
 
-  // Lưu lịch sử
+  // lưu HIS
   await saveHistory(hist[0]);
 
-  const seq = hist
-    .slice(0, 10)
-    .map((x) => (x.BetSide === 0 ? "T" : "X"))
-    .join("");
+  // đọc HIS → lấy 10 tay gần nhất
+  let his = [];
+  try {
+    his = await fs.readJson(HIS_FILE);
+  } catch {}
 
-  const pattern = matchPattern(seq);
-  const predict = pattern ? pattern.predict : voting(hist);
+  const last10 = his.slice(0, 10);
 
+  // tạo seq pattern = t/x
+  const seq = last10.map((x) => (x.BetSide === 0 ? "t" : "x")).join("");
+
+  // kiểm tra có trúng cầu.txt không
+  const cauPredict = matchPattern(seq.toUpperCase());
+
+  let finalPredict = cauPredict ?? voting(hist);
+
+  // JSON trả về
   res.json({
-    phien_hien_tai: hist[0].SessionId,
-    phien_tiep_theo: String(Number(hist[0].SessionId) + 1),
-    xuc_xac: [hist[0].FirstDice, hist[0].SecondDice, hist[0].ThirdDice],
-    tong: hist[0].DiceSum,
-    ket_qua: hist[0].BetSide === 0 ? "TÀI" : "XỈU",
-    chuoi_10: seq,
-    du_doan: predict,
-    pattern: pattern || null,
+    id: "tiendat09868",
+    Phien: Number(hist[0].SessionId),
+    Phien_tiep_theo: Number(hist[0].SessionId) + 1,
+
+    Xuc_xac_1: hist[0].FirstDice,
+    Xuc_xac_2: hist[0].SecondDice,
+    Xuc_xac_3: hist[0].ThirdDice,
+    Tong: hist[0].DiceSum,
+
+    Ket_qua: hist[0].BetSide === 0 ? "Tài" : "Xỉu",
+
+    Pattern: seq,            // pattern HIS
+    Du_doan: finalPredict    // ưu tiên cầu.txt → AI
   });
 });
 
-// ===================== API LẤY LỊCH SỬ =====================
+// ===================== API LỊCH SỬ =====================
 app.get("/api/his", async (req, res) => {
   try {
-    if (!(await fs.pathExists(HIS_FILE))) {
-      return res.json([]);
-    }
-    const data = await fs.readJson(HIS_FILE);
-    res.json(data);
-  } catch (e) {
-    res.json({ error: "Không thể đọc lịch sử", detail: e.toString() });
+    if (!(await fs.pathExists(HIS_FILE))) return res.json([]);
+
+    res.json(await fs.readJson(HIS_FILE));
+  } catch {
+    res.json([]);
   }
 });
 
-// ===================== SERVER =====================
+// ===================== START =====================
 app.listen(PORT, () =>
-  console.log(`🔥 XocDia AI đang chạy trên PORT ${PORT}`)
+  console.log(`🔥 XocDia AI chạy trên PORT ${PORT}`)
 );
