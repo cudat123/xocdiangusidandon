@@ -15,7 +15,7 @@ app.use(express.json());
 const PORT = process.env.PORT || 3000;
 
 const API_URL =
-  "https://taixiu.system32-cloudfare-356783752985678522.monster/api/luckydice/GetSoiCau";
+  "https://taixiumd5.system32-cloudfare-356783752985678522.monster/api/md5luckydice/GetSoiCau";
 
 const HIS_FILE = path.join(__dirname, "history.json");
 const MAX_HIS_LENGTH = 5000; // Giới hạn lưu lịch sử tối đa
@@ -8475,3 +8475,4 @@ app.get("/api/his", async (req, res) => {
 app.listen(PORT, () => {
   console.log("🔥 MAX AI XocDia đang chạy trên PORT", PORT);
 });
+
