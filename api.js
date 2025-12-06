@@ -8375,7 +8375,7 @@ function voting(cau, akira, trend, l1, l2) {
 // =================================================================================
 // API CHÍNH /xocdia88
 // =================================================================================
-app.get("/api/soclo", async (req, res) => {
+app.get("/xocdia88", async (req, res) => {
   const apiData = await fetchData();
   if (!apiData.length) return res.json({ error: "Không lấy được dữ liệu" });
 
@@ -8395,6 +8395,22 @@ app.get("/api/soclo", async (req, res) => {
   if (his.length > 5000) his = his.slice(0, 5000);
   await saveHistory(his);
 
+  // ---------------------------------------------------------
+  // 🔥 Nếu chưa đủ 10 phiên → KHÔNG chạy AI
+  // ---------------------------------------------------------
+  if (his.length < 10) {
+    return res.json({
+      id: "tiendat09868",
+      Phien: newItem.phien,
+      Xuc_xac_1: newItem.xuc_xac_1,
+      Xuc_xac_2: newItem.xuc_xac_2,
+      Xuc_xac_3: newItem.xuc_xac_3,
+      Tong: newItem.tong,
+      Ket_qua: newItem.ket_qua,
+      Du_doan: "Đợi thêm dữ liệu (>=10 tay)",
+    });
+  }
+
   const last10 = his.slice(0, 10);
   const seq10 = last10.map(e => convertTX(e.ket_qua)).join("");
 
@@ -8406,6 +8422,10 @@ app.get("/api/soclo", async (req, res) => {
 
   const predict = voting(cau, ak, tr, l1, l2);
 
+  // ---------------------------------------------------------
+  // 🔥 BỎ "Cau_khop" → KHÔNG TRẢ VỀ NỮA
+  // ---------------------------------------------------------
+
   res.json({
     id: "tiendat09868",
     Phien: newItem.phien,
@@ -8414,27 +8434,6 @@ app.get("/api/soclo", async (req, res) => {
     Xuc_xac_3: newItem.xuc_xac_3,
     Tong: newItem.tong,
     Ket_qua: newItem.ket_qua,
-    Du_doan: predict,
-    Cau_khop: cau || "Không match",
+    Du_doan: predict
   });
-});
-
-// =================================================================================
-// API /his – xem toàn bộ lịch sử
-// =================================================================================
-app.get("/his", async (req, res) => {
-  try {
-    const his = await loadHistory();
-    res.json({
-      total: his.length,
-      data: his,
-    });
-  } catch {
-    res.json({ total: 0, data: [] });
-  }
-});
-
-// =================================================================================
-app.listen(PORT, () => {
-  console.log("🔥 MAX AI XocDia đang chạy trên PORT", PORT);
 });
