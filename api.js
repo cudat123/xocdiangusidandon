@@ -18,12 +18,13 @@ const API_URL =
   "https://taixiu.system32-cloudfare-356783752985678522.monster/api/luckydice/GetSoiCau";
 
 const HIS_FILE = path.join(__dirname, "history.json");
+const MAX_HIS_LENGTH = 5000; // Giới hạn lưu lịch sử tối đa
 
 // =================================================================================
 // 🎯 DÁN FULL FILE CAU.TXT Ở ĐÂY ↓↓↓↓↓
 // =================================================================================
 
-const RAW_CAU_TXT =`
+const RAW_CAU_TXT = `
 TTTTTTTTTTTTT => Dự đoán: T - Loại cầu: Cầu bệt (liên tiếp giống nhau)
 TTTTTTTTTTTTX => Dự đoán: T - Loại cầu: Cầu 3-1 (3 bên này - 1 bên kia)
 TTTTTTTTTTTXT => Dự đoán: X - Loại cầu: Cầu kẹp (kẹp giữa T hoặc X)
@@ -8216,8 +8217,7 @@ XXXXXXXXXXXTT => Dự đoán: T - Loại cầu: Cầu 2-2 (2 Tài - 2 Xỉu lặ
 XXXXXXXXXXXTX => Dự đoán: T - Loại cầu: Cầu kẹp (kẹp giữa T hoặc X)
 XXXXXXXXXXXXT => Dự đoán: X - Loại cầu: Cầu 3-1 (3 bên này - 1 bên kia)
 XXXXXXXXXXXXX => Dự đoán: X - Loại cầu: Cầu bệt (liên tiếp giống nhau)
-`; 
-
+`;
 let CAU_LIST = [];
 
 // =================================================================================
@@ -8225,6 +8225,7 @@ let CAU_LIST = [];
 // =================================================================================
 function loadCau() {
   const lines = RAW_CAU_TXT.split("\n").map(v => v.trim()).filter(v => v.includes("=>"));
+  CAU_LIST = []; // Reset CAU_LIST
   for (const ln of lines) {
     const m = ln.match(/^([TX]+)\s*=>\s*Dự đoán:\s*([TX])/i);
     if (m) {
@@ -8255,6 +8256,7 @@ async function fetchData(limit = 50) {
       kq: e.BetSide === 0 ? "TÀI" : "XỈU",
     }));
   } catch (err) {
+    console.error("Lỗi khi fetch API:", err.message);
     return [];
   }
 }
@@ -8268,7 +8270,8 @@ async function saveHistory(arr) {
 
 async function loadHistory() {
   try {
-    return await fs.readJson(HIS_FILE);
+    const his = await fs.readJson(HIS_FILE);
+    return Array.isArray(his) ? his : [];
   } catch {
     return [];
   }
@@ -8316,6 +8319,9 @@ function matchCau(seq10) {
 // AKIRA FULL
 // =================================================================================
 function akiraFull(arr) {
+  // Đảm bảo có đủ 2 tay gần nhất
+  if (arr.length < 2) return arr.length > 0 ? arr[0].kq : "TÀI";
+
   let last = arr[0];
   let prev = arr[1];
 
@@ -8325,6 +8331,7 @@ function akiraFull(arr) {
   score += last.tong % 2 === 0 ? 0.7 : -0.4;
   if (prev && prev.kq === last.kq) score -= 1.2;
 
+  // Lấy 10 tay để đếm T/X (hoặc ít hơn nếu lịch sử không đủ 10)
   let t = 0, x = 0;
   arr.slice(0, 10).forEach(e => (e.kq === "TÀI" ? t++ : x++));
   score += t > x ? 0.8 : -0.8;
@@ -8336,6 +8343,7 @@ function akiraFull(arr) {
 // TREND AI
 // =================================================================================
 function trendAI(arr) {
+  // Lấy 12 tay (hoặc ít hơn nếu lịch sử không đủ 12)
   let t = 0, x = 0;
   arr.slice(0, 12).forEach(e => (e.kq === "TÀI" ? t++ : x++));
   return t > x ? "TÀI" : "XỈU";
@@ -8345,9 +8353,11 @@ function trendAI(arr) {
 // LOGIC CŨ
 // =================================================================================
 function logic1(arr) {
+  if (arr.length === 0) return "TÀI"; // Mặc định nếu không có lịch sử
   return arr[0].kq === "TÀI" ? "XỈU" : "TÀI";
 }
 function logic2(arr) {
+  if (arr.length === 0) return "XỈU"; // Mặc định nếu không có lịch sử
   return arr[0].kq;
 }
 
@@ -8375,42 +8385,51 @@ function voting(cau, akira, trend, l1, l2) {
 // =================================================================================
 // API CHÍNH /xocdia88
 // =================================================================================
-app.get("/xocdia88", async (req, res) => {
+app.get("/api/soclo88", async (req, res) => {
   const apiData = await fetchData();
-  if (!apiData.length) return res.json({ error: "Không lấy được dữ liệu" });
+  if (!apiData.length) return res.json({ error: "Không lấy được dữ liệu API" });
 
   let his = await loadHistory();
 
-  const newItem = {
-    phien: apiData[0].phien,
-    xuc_xac_1: apiData[0].x1,
-    xuc_xac_2: apiData[0].x2,
-    xuc_xac_3: apiData[0].x3,
-    tong: apiData[0].tong,
-    ket_qua: apiData[0].kq,
-  };
-
-  his.unshift(newItem);
-
-  if (his.length > 5000) his = his.slice(0, 5000);
-  await saveHistory(his);
-
-  // ---------------------------------------------------------
-  // 🔥 Nếu chưa đủ 10 phiên → KHÔNG chạy AI
-  // ---------------------------------------------------------
-  if (his.length < 10) {
-    return res.json({
-      id: "tiendat09868",
-      Phien: newItem.phien,
-      Xuc_xac_1: newItem.xuc_xac_1,
-      Xuc_xac_2: newItem.xuc_xac_2,
-      Xuc_xac_3: newItem.xuc_xac_3,
-      Tong: newItem.tong,
-      Ket_qua: newItem.ket_qua,
-      Du_doan: "Đợi thêm dữ liệu (>=10 tay)",
-    });
+  // 1. Cập nhật lịch sử
+  const newPhien = apiData[0].phien;
+  const lastPhienInHis = his.length > 0 ? his[0].phien : 0;
+  
+  // Chỉ thêm vào nếu phiên mới hơn phiên đã lưu gần nhất
+  if (newPhien > lastPhienInHis) {
+    const newItem = {
+      phien: newPhien,
+      xuc_xac_1: apiData[0].x1,
+      xuc_xac_2: apiData[0].x2,
+      xuc_xac_3: apiData[0].x3,
+      tong: apiData[0].tong,
+      ket_qua: apiData[0].kq,
+    };
+    his.unshift(newItem);
+  } else if (his.length === 0) {
+     // Nếu lịch sử rỗng, thêm phiên hiện tại vào
+     const newItem = {
+      phien: newPhien,
+      xuc_xac_1: apiData[0].x1,
+      xuc_xac_2: apiData[0].x2,
+      xuc_xac_3: apiData[0].x3,
+      tong: apiData[0].tong,
+      ket_qua: apiData[0].kq,
+    };
+    his.unshift(newItem);
+  } else {
+    // Nếu phiên hiện tại không mới hơn (đã có hoặc phiên cũ hơn), không thêm gì cả.
   }
 
+
+  // Giới hạn số lượng lịch sử lưu trữ
+  if (his.length > MAX_HIS_LENGTH) his = his.slice(0, MAX_HIS_LENGTH);
+  await saveHistory(his);
+
+  // 2. Phân tích chỉ với 10 tay gần nhất (hoặc ít hơn nếu his không đủ)
+  // Đảm bảo his phải có ít nhất 1 phần tử
+  if (his.length === 0) return res.json({ error: "Lịch sử rỗng, không thể phân tích" });
+  
   const last10 = his.slice(0, 10);
   const seq10 = last10.map(e => convertTX(e.ket_qua)).join("");
 
@@ -8421,19 +8440,38 @@ app.get("/xocdia88", async (req, res) => {
   const l2 = logic2(last10);
 
   const predict = voting(cau, ak, tr, l1, l2);
+  const currentResult = his[0]; // Lấy kết quả mới nhất (vừa thêm vào)
 
-  // ---------------------------------------------------------
-  // 🔥 BỎ "Cau_khop" → KHÔNG TRẢ VỀ NỮA
-  // ---------------------------------------------------------
-
+  // 3. Trả về kết quả (BỎ Cau_khop)
   res.json({
     id: "tiendat09868",
-    Phien: newItem.phien,
-    Xuc_xac_1: newItem.xuc_xac_1,
-    Xuc_xac_2: newItem.xuc_xac_2,
-    Xuc_xac_3: newItem.xuc_xac_3,
-    Tong: newItem.tong,
-    Ket_qua: newItem.ket_qua,
-    Du_doan: predict
+    Phien: currentResult.phien,
+    Xuc_xac_1: currentResult.xuc_xac_1,
+    Xuc_xac_2: currentResult.xuc_xac_2,
+    Xuc_xac_3: currentResult.xuc_xac_3,
+    Tong: currentResult.tong,
+    Ket_qua: currentResult.ket_qua,
+    Du_doan: predict,
   });
+});
+
+// =================================================================================
+// API /his – xem toàn bộ lịch sử
+// =================================================================================
+app.get("/api/his", async (req, res) => {
+  try {
+    const his = await loadHistory();
+    res.json({
+      total: his.length,
+      limit: MAX_HIS_LENGTH,
+      data: his,
+    });
+  } catch {
+    res.json({ total: 0, limit: MAX_HIS_LENGTH, data: [] });
+  }
+});
+
+// =================================================================================
+app.listen(PORT, () => {
+  console.log("🔥 MAX AI XocDia đang chạy trên PORT", PORT);
 });
