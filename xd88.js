@@ -1,4 +1,3 @@
-// server.js (XENG16 - Upstash Redis edition)
 const express = require("express");
 const axios = require("axios");
 const cors = require("cors");
@@ -8,14 +7,21 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
+/* ===================== CONFIG ===================== */
 const PORT = process.env.PORT || 3000;
 const MY_ID = process.env.MY_ID || "tiendat";
 const API_URL = process.env.API_URL || "https://taixiu.system32-cloudfare-356783752985678522.monster/api/luckydice/GetSoiCau";
-
-const MAX_HIS = Number(process.env.MAX_HIS) || 500;
+const MAX_HIS = Number(process.env.MAX_HIS) || 1000;
 const POLL_INTERVAL = Number(process.env.POLL_INTERVAL_MS) || 8000;
+const VIP_INFLUENCE = Number(process.env.VIP_INFLUENCE) || 0.40; // VIP weight portion (default 0.40)
+const BASE_ENGINE_PORTION = Math.max(0, 1 - VIP_INFLUENCE); // rest assigned to other engines
+const APR_BOOST_STEP = 0.06; // how much to boost pattern.score on consecutive wins
+const APR_PENALTY_STEP = 0.05; // penalty on fails
+const APR_MAX_SCORE = 1.5; // cap multiplier
+const APR_MIN_SCORE = 0.1;
+/* ================================================== */
 
-// Upstash Redis client
+/* ================ Upstash Redis client ============== */
 if (!process.env.UPSTASH_REDIS_REST_URL || !process.env.UPSTASH_REDIS_REST_TOKEN) {
   console.error("Missing UPSTASH_REDIS_REST_URL or UPSTASH_REDIS_REST_TOKEN env vars");
   process.exit(1);
@@ -24,926 +30,18 @@ const redis = new Redis({
   url: process.env.UPSTASH_REDIS_REST_URL,
   token: process.env.UPSTASH_REDIS_REST_TOKEN
 });
+const HIS_KEY = "xeng17:history";
+const MEM_KEY = "xeng17:memory";
 
-const HIS_KEY = "xeng16:history";   // list (newest-first)
-const MEM_KEY = "xeng16:memory";    // string JSON
-
-// ---------------- memory default ----------------
-const defaultMemory = {
-  patterns: {},
-  weights: {
-    oldSimple: 0.8,
-    patternLookup: 2.0,
-    fuzzyMatch: 1.2,
-    trend: 1.0,
-    momentum: 1.0,
-    powerRank: 1.4,
-    akira: 1.6
-  },
-  stats: { totalPred:0, totalCorrect:0 },
-  settings: {
-    patternMinLen: 3,
-    patternMaxLen: 7,
-    minPatternOccurrences: 2,
-    lockoutAfterFails: 3,
-    memoryKeepPatterns: 2500,
-    updatePatternEvery: 5
-  }
-};
-
-let MEMORY = { ...defaultMemory };
-
-// ---------------- Redis wrappers ----------------
-async function loadMemory() {
-  try {
-    const raw = await redis.get(MEM_KEY);
-    if (raw) {
-      MEMORY = JSON.parse(raw);
-      console.log("Loaded memory from redis, patterns:", Object.keys(MEMORY.patterns||{}).length);
-    } else {
-      MEMORY = { ...defaultMemory };
-      await saveMemory();
-      console.log("Initialized memory in redis");
-    }
-  } catch (e) { console.error("loadMemory err", e.message||e); MEMORY = { ...defaultMemory }; }
-}
-
-async function saveMemory() {
-  try {
-    await redis.set(MEM_KEY, JSON.stringify(MEMORY));
-  } catch (e) { console.error("saveMemory err", e.message||e); }
-}
-
-async function pushHistory(item) {
-  // item expected to be plain object
-  try {
-    await redis.lpush(HIS_KEY, JSON.stringify(item));
-    // keep only MAX_HIS newest
-    await redis.ltrim(HIS_KEY, 0, MAX_HIS - 1);
-  } catch (e) { console.error("pushHistory err", e.message||e); }
-}
-
-async function getHistory(limit = MAX_HIS) {
-  try {
-    const arr = await redis.lrange(HIS_KEY, 0, limit - 1); // newest-first
-    return arr.map(s => {
-      try { return JSON.parse(s); } catch(e){ return null; }
-    }).filter(Boolean);
-  } catch (e) { console.error("getHistory err", e.message||e); return []; }
-}
-
-async function getLatestPhienLocal(){
-  try {
-    const raw = await redis.lindex(HIS_KEY, 0);
-    if (!raw) return 0;
-    const obj = JSON.parse(raw);
-    return Number(obj.phien || 0);
-  } catch(e){ return 0; }
-}
-
-// ---------------- fetch remote ----------------
-async function fetchRemote(limit=50) {
-  try{
-    const r = await axios.get(API_URL, { timeout: 6000 });
-    const arr = Array.isArray(r.data) ? r.data.slice(0, limit) : [];
-    return arr.map(e => ({
-      phien: Number(e.SessionId),
-      x1: Number(e.FirstDice),
-      x2: Number(e.SecondDice),
-      x3: Number(e.ThirdDice),
-      tong: Number(e.DiceSum),
-      kq: e.BetSide === 0 ? "T" : "X",
-      ts: Date.now()
-    }));
-  }catch(e){ return []; }
-}
-
-// ---------------- utilities for sequences ----------------
-function seqNewestFirst(his, len=500) { return his.slice(0, len).map(i => i.kq).join(""); } // newest-first
-function seqOldestFirst(his, len=500) { return his.slice(0, len).map(i => i.kq).reverse().join(""); } // oldest->newest
-
-// ---------------- Old Simple (unchanged) ----------------
-function oldSimplePredict(his) {
-  if (!his || his.length < 10) return { pred: "N/A", reason: "Bad data" };
-  const seq = his.slice(0,20).map(i => i.kq).join("");
-  const head = seq[0];
-  const m = seq.match(new RegExp(`^${head}+`));
-  const streak = m ? m[0].length : 0;
-  if (streak >= 4) return { pred: head === "T" ? "X" : "T", reason: `Old: bệt ${head} x${streak}` };
-  if (/^(TX|XT){3,}/.test(seq.substring(0,6))) return { pred: seq[0] === "T" ? "X" : "T", reason: "Old: 1-1" };
-  const cT = seq.split("T").length - 1, cX = seq.split("X").length - 1;
-  if (cT > cX) return { pred: "T", reason: `Old: ratio T>${cX} (${cT}:${cX})` };
-  if (cX > cT) return { pred: "X", reason: `Old: ratio X>${cT} (${cT}:${cX})` };
-  return { pred: seq[0] === "T" ? "X" : "T", reason: "Old: fallback" };
-}
-
-// ---------------- V-Engine modules ----------------
-function detectMarketState(his) {
-  const window = Math.min(50, his.length);
-  if (window < 10) return "unknown";
-  const seq = seqNewestFirst(his, window);
-  let runs=1, last=seq[0];
-  for (let i=1;i<seq.length;i++){ if (seq[i]!==last){ runs++; last=seq[i]; } }
-  const runDensity = runs/seq.length;
-  if (runDensity < 0.15) return "trending";
-  if (runDensity > 0.5) return "volatile";
-  return "random";
-}
-
-function extractPatterns(his, minL, maxL) {
-  const seq = seqOldestFirst(his, 500);
-  const map = {};
-  for (let L=minL; L<=maxL; L++){
-    for (let i=0;i+L<=seq.length;i++){
-      const p = seq.slice(i,i+L);
-      if (!p) continue;
-      map[p] = (map[p]||0)+1;
-    }
-  }
-  return map;
-}
-
-function updatePatternDB(his) {
-  try {
-    const s = MEMORY.settings;
-    const counts = extractPatterns(his, s.patternMinLen, s.patternMaxLen);
-    Object.keys(counts).forEach(p=>{
-      const c = counts[p];
-      if (c >= s.minPatternOccurrences) {
-        if (!MEMORY.patterns[p]) MEMORY.patterns[p] = { count:c, success:0, fail:0, score:0, lastSeen:Date.now(), lockedUntil:0 };
-        else { MEMORY.patterns[p].count = Math.max(MEMORY.patterns[p].count, c); MEMORY.patterns[p].lastSeen = Date.now(); }
-      }
-    });
-    // prune
-    const keys = Object.keys(MEMORY.patterns);
-    if (keys.length > s.memoryKeepPatterns) {
-      const sorted = keys.sort((a,b)=> (MEMORY.patterns[b].count*(MEMORY.patterns[b].score+1)) - (MEMORY.patterns[a].count*(MEMORY.patterns[a].score+1)));
-      const keep = new Set(sorted.slice(0, s.memoryKeepPatterns));
-      Object.keys(MEMORY.patterns).forEach(k=>{ if (!keep.has(k)) delete MEMORY.patterns[k]; });
-    }
-  } catch(e){ console.error("updatePatternDB err", e.message||e); }
-}
-
-// patternLookupPredict, fuzzyMatchPredict, trendPredict, momentumPredict, powerRankPredict
-// Akira module and vEnginePredict and unifiedPredict - copy from original file (kept intact)
-function patternLookupPredict(his) {
-  const tailLen = MEMORY.settings.patternMaxLen;
-  const recent = seqOldestFirst(his, tailLen+2);
-  const lastPart = recent.slice(-tailLen);
-  const candidates = {};
-  for (let p in MEMORY.patterns) {
-    if (lastPart.endsWith(p)) candidates[p] = MEMORY.patterns[p];
-  }
-  if (Object.keys(candidates).length===0) return null;
-  const hist = seqOldestFirst(his, 1000);
-  const tally = { T:0, X:0 };
-  Object.keys(candidates).forEach(p=>{
-    let idx=0;
-    while((idx = hist.indexOf(p, idx)) !== -1) {
-      const nextIdx = idx + p.length;
-      if (nextIdx < hist.length) {
-        const nxt = hist[nextIdx];
-        if (nxt==='T' || nxt==='X') tally[nxt] += 1 * (MEMORY.patterns[p].count || 1);
-      }
-      idx++;
-    }
-  });
-  const total = tally.T + tally.X;
-  if (total === 0) return null;
-  return { pred: tally.T >= tally.X ? "T":"X", conf: Math.max(tally.T, tally.X)/total, reason: `patternLookup T:${tally.T} X:${tally.X}` };
-}
-
-function fuzzyMatchPredict(his) {
-  const shortPat = seqOldestFirst(his, 15).slice(-15);
-  const longPat = seqOldestFirst(his, 200);
-  if (!shortPat || shortPat.length < 6 || !longPat) return null;
-  let best = { pct:0, match:"", idx:-1 };
-  const L = shortPat.length;
-  for (let i=0;i+L<=longPat.length;i++){
-    const slice = longPat.slice(i,i+L);
-    let same=0;
-    for (let j=0;j<L;j++) if (slice[j]===shortPat[j]) same++;
-    const pct = (same/L)*100;
-    if (pct > best.pct) best = { pct, match: slice, idx:i };
-  }
-  if (best.pct >= 80) {
-    const nextIdx = best.idx + L;
-    if (nextIdx < longPat.length) return { pred: longPat[nextIdx], conf: best.pct/100, reason: `fuzzy ${best.pct.toFixed(1)}%` };
-  }
-  return null;
-}
-
-function trendPredict(his) {
-  const window = Math.min(his.length,50);
-  if (window < 6) return null;
-  const seq = seqOldestFirst(his, window);
-  const t = (seq.match(/T/g)||[]).length;
-  const x = (seq.match(/X/g)||[]).length;
-  const total = t+x;
-  if (total===0) return null;
-  if (t/total > 0.6) return { pred:"T", conf:t/total, reason:`trend T ${t}/${total}` };
-  if (x/total > 0.6) return { pred:"X", conf:x/total, reason:`trend X ${x}/${total}` };
-  return null;
-}
-
-function momentumPredict(his) {
-  const seq = seqNewestFirst(his, 20);
-  if (!seq || seq.length < 4) return null;
-  const head = seq[0]; let streak=1;
-  for (let i=1;i<seq.length;i++){ if (seq[i]===head) streak++; else break; }
-  if (streak >=2 && streak <=4) return { pred: head, conf: 0.5 + (streak*0.1), reason:`momentum ${head} x${streak}` };
-  return null;
-}
-
-function powerRankPredict(his) {
-  const seq = seqOldestFirst(his, 100);
-  if (!seq || seq.length < 6) return null;
-  let scoreT=0, scoreX=0;
-  const b = seq.match(/T{4,}/) ? "T" : seq.match(/X{4,}/) ? "X" : null;
-  if (b==="T") scoreX += 8;
-  if (b==="X") scoreT += 8;
-  const tail6 = seq.slice(-6);
-  if (/^(TX|XT){3}$/.test(tail6)) {
-    const next = tail6[0]==='T'?'X':'T';
-    if (next==='T') scoreT += 6; else scoreX += 6;
-  }
-  const tcount = (seq.match(/T/g)||[]).length, xcount = (seq.match(/X/g)||[]).length;
-  if (tcount - xcount >= Math.ceil(seq.length*0.2)) scoreT += 4;
-  if (xcount - tcount >= Math.ceil(seq.length*0.2)) scoreX += 4;
-  let dbT=0, dbX=0;
-  for (let p in MEMORY.patterns) {
-    const rec = MEMORY.patterns[p];
-    if (!rec.count) continue;
-    const last = p[p.length-1];
-    if (last==='T') dbT += rec.count;
-    if (last==='X') dbX += rec.count;
-  }
-  if (dbT + dbX > 0) { if (dbT > dbX) scoreT += 2; else scoreX += 2; }
-  const pred = scoreT >= scoreX ? "T" : "X";
-  const conf = Math.min(0.98, Math.max(0.05, Math.abs(scoreT-scoreX)/(Math.abs(scoreT)+Math.abs(scoreX)+1)));
-  return { pred, conf, reason: `powerRank T:${scoreT} X:${scoreX}` };
-}
-
-// Akira module (detectPatterns, aiBatBet, aiBeBet, akiraPredict) - copied from original
-function detectPatterns(his) {
-  const seqNew = seqNewestFirst(his, 40);
-  const out = { is121:false, is212:false, is22:false, is11:false, longBett:false, bHead:'', headLen:0 };
-  if (!seqNew || seqNew.length < 4) return out;
-  const head = seqNew[0];
-  let headLen=1;
-  for (let i=1;i<seqNew.length;i++){ if (seqNew[i]===head) headLen++; else break; }
-  out.bHead = head; out.headLen = headLen;
-  if (headLen >=4) out.longBett = true;
-  const s6 = seqNew.slice(0,6);
-  if (/^(TX|XT){3}$/.test(s6)) out.is11 = true;
-  const s8 = seqNew.slice(0,8);
-  if (/^(TTXX|XXTT){2,}$/.test(s8)) out.is22 = true;
-  if (seqNew[0] && seqNew[1] && seqNew[2] && seqNew[3]) {
-    const s4 = seqNew.slice(0,4);
-    if (s4[0] === s4[3] && s4[1] === s4[2] && s4[0] !== s4[1]) out.is121 = true;
-  }
-  const s5 = seqNew.slice(0,5);
-  if (s5.length===5 && s5[0]===s5[1] && s5[3]===s5[4] && s5[0]===s5[4] && s5[2]!==s5[0]) out.is212 = true;
-  return out;
-}
-
-function aiBatBet(his) {
-  const pat = detectPatterns(his);
-  if (!pat.longBett) return null;
-  const head = pat.bHead;
-  const headLen = pat.headLen;
-  if (headLen >= 6) return { pred: head === "T" ? "X":"T", conf: 0.6 - Math.min(0.3, (headLen-6)*0.03), reason: `Akira: long bet gãy soon len=${headLen}` };
-  let followCount = 0, followTotal=0;
-  const seqOld = seqOldestFirst(his, 500);
-  const p = head.repeat(headLen);
-  let idx=0;
-  while((idx = seqOld.indexOf(p, idx)) !== -1) {
-    const nextIdx = idx + p.length;
-    if (nextIdx < seqOld.length) { followTotal++; if (seqOld[nextIdx]===head) followCount++; }
-    idx++;
-  }
-  if (followTotal>0 && (followCount/followTotal) > 0.5) {
-    return { pred: head, conf: 0.45 + Math.min(0.35, followCount/followTotal*0.4), reason: `Akira: batbet followRate ${(followCount/followTotal).toFixed(2)}` };
-  }
-  return { pred: head === "T" ? "X":"T", conf: 0.55, reason: "Akira: batbet default reverse" };
-}
-
-function aiBeBet(his) {
-  const pat = detectPatterns(his);
-  if (!pat.longBett) return null;
-  const head = pat.bHead;
-  const headLen = pat.headLen;
-  if (headLen >= 4) {
-    const hist = seqOldestFirst(his, 1000);
-    const p = head.repeat(headLen);
-    let idx=0, tT=0, tX=0;
-    while((idx = hist.indexOf(p, idx)) !== -1) {
-      const nxt = hist[idx + p.length];
-      if (nxt==='T') tT++; if (nxt==='X') tX++;
-      idx++;
-    }
-    if (tT + tX > 0) {
-      const pred = tT >= tX ? 'T' : 'X';
-      const conf = Math.max(0.55, Math.min(0.9, Math.max(tT,tX)/(tT+tX)));
-      return { pred, conf, reason: `Akira: bebet tally T:${tT} X:${tX}`};
-    }
-    return { pred: head === "T" ? "X":"T", conf: 0.6, reason: "Akira: bebet fallback break" };
-  }
-  return null;
-}
-
-function akiraPredict(his) {
-  const mod = [];
-  const bat = aiBatBet(his); if (bat) mod.push({name:"aiBatBet", ...bat, weight:1.0});
-  const beb = aiBeBet(his); if (beb) mod.push({name:"aiBeBet", ...beb, weight:1.2});
-  const patterns = detectPatterns(his);
-  if (patterns.is11) mod.push({ name:"akira_is11", pred: seqNewestFirst(his,6)[0]==='T' ? 'X':'T', conf:0.45, reason:"akira detect 1-1", weight:0.8});
-  if (patterns.is22) mod.push({ name:"akira_is22", pred: seqNewestFirst(his,8)[0]==='T' ? 'X':'T', conf:0.6, reason:"akira detect 2-2", weight:1.0});
-  const seq = seqOldestFirst(his,20);
-  const t=(seq.match(/T/g)||[]).length, x=(seq.match(/X/g)||[]).length;
-  if (t!==x) mod.push({name:"akira_ratio", pred: t>x?'T':'X', conf: Math.abs(t-x)/20, reason:"akira ratio", weight:0.6});
-  if (!mod.length) return { prediction:"N/A", confidence:0, reasons:["akira no model"] };
-  let score = {T:0, X:0}; const reasons=[];
-  mod.forEach((m, idx)=>{
-    const w = (m.weight||1) * (MEMORY.weights.akira||1);
-    const conf = Math.min(0.99, Math.max(0.01, m.conf||0.5));
-    if (m.pred === 'T') score.T += w * conf; else if (m.pred === 'X') score.X += w * conf;
-    reasons.push(`${m.name}:${m.reason||''} (w=${w.toFixed(2)} conf=${conf.toFixed(2)})`);
-  });
-  const final = score.T >= score.X ? 'T':'X';
-  const conf = Math.max(0.01, Math.min(0.999, Math.max(score.T,score.X)/(score.T+score.X||1)));
-  return { prediction: final, confidence: conf, reasons };
-}
-
-// vEnginePredict
-function vEnginePredict(his) {
-  const models = [];
-  const pl = patternLookupPredict(his); if (pl) models.push({n:"patternLookup", pred:pl.pred, conf:pl.conf, reason:pl.reason, weight: MEMORY.weights.patternLookup||1.2});
-  const fz = fuzzyMatchPredict(his); if (fz) models.push({n:"fuzzy", pred:fz.pred, conf:fz.conf, reason:fz.reason, weight: MEMORY.weights.fuzzyMatch||1.0});
-  const tr = trendPredict(his); if (tr) models.push({n:"trend", pred:tr.pred, conf:tr.conf, reason:tr.reason, weight: MEMORY.weights.trend||1.0});
-  const mo = momentumPredict(his); if (mo) models.push({n:"momentum", pred:mo.pred, conf:mo.conf, reason:mo.reason, weight: MEMORY.weights.momentum||1.0});
-  const pr = powerRankPredict(his); if (pr) models.push({n:"powerRank", pred:pr.pred, conf:pr.conf, reason:pr.reason, weight: MEMORY.weights.powerRank||1.0});
-  const oldm = oldSimplePredict(his); if (oldm && oldm.pred!=="N/A") models.push({n:"oldSimple", pred:oldm.pred, conf:0.6, reason:oldm.reason, weight: MEMORY.weights.oldSimple||0.8});
-  if (!models.length) return { prediction:"N/A", confidence:0, reasons:["no models"] };
-  let score={T:0, X:0}, reasons=[];
-  models.forEach(m=>{
-    const w = m.weight||1; const conf = Math.min(0.99, Math.max(0.01, m.conf||0.5));
-    if (m.pred === 'T') score.T += w*conf; else score.X += w*conf;
-    reasons.push(`${m.n}:${m.reason} (w=${w.toFixed(2)} conf=${conf.toFixed(2)})`);
-  });
-  const market = detectMarketState(his);
-  if (market === "volatile") { score.T *= 0.92; score.X *= 0.92; }
-  else if (market === "trending") { const bonus=1.06; score.T*=bonus; score.X*=bonus; }
-  const final = score.T >= score.X ? 'T':'X';
-  const conf = Math.max(0.01, Math.min(0.999, Math.max(score.T,score.X)/(score.T+score.X||1)));
-  return { prediction: final, confidence: conf, reasons };
-}
-
-// unifiedPredict
-function unifiedPredict(his) {
-  const v = vEnginePredict(his);
-  const a = akiraPredict(his);
-  const o = oldSimplePredict(his);
-
-  const alphaV = 0.45, alphaA = 0.35, alphaO = 0.2;
-  let score={T:0,X:0};
-  const reasons = [];
-
-  if (v && v.prediction!=="N/A") { score[v.prediction] += alphaV * ((v.confidence||v.conf||0.5) * (MEMORY.weights.powerRank||1)); if (v.reasons) reasons.push(...(v.reasons||[]).slice(0,3)); }
-  if (a && a.prediction!=="N/A") { score[a.prediction] += alphaA * (a.confidence||0.5) * (MEMORY.weights.akira||1); if (a.reasons) reasons.push(...(a.reasons||[]).slice(0,3)); }
-  if (o && o.pred!=="N/A") { score[o.pred] += alphaO * ((o.confidence||0.6) * (MEMORY.weights.oldSimple||0.8)); if (o.reason) reasons.push(o.reason); }
-
-  if (score.T === 0 && score.X === 0) {
-    if (o && o.pred) return { prediction: o.pred, confidence:0.5, reasons:[o.reason] };
-    return { prediction:"N/A", confidence:0, reasons:["no engines"] };
-  }
-  const final = score.T >= score.X ? 'T' : 'X';
-  const conf = Math.max(0.01, Math.min(0.999, Math.max(score.T,score.X)/(score.T+score.X||1)));
-  return { prediction: final, confidence: conf, reasons: reasons.slice(0,6) };
-}
-
-// ---------------- feedback learning ----------------
-async function feedbackUpdate(predictionShort, actualShort) {
-  try {
-    MEMORY.stats.totalPred = (MEMORY.stats.totalPred||0) + 1;
-    if (predictionShort === actualShort) MEMORY.stats.totalCorrect = (MEMORY.stats.totalCorrect||0) + 1;
-    const his = await getHistory();
-    const recent = seqOldestFirst(his, 20);
-    const suffixes = [];
-    for (let L=MEMORY.settings.patternMinLen; L<=Math.min(MEMORY.settings.patternMaxLen, recent.length); L++) suffixes.push(recent.slice(-L));
-    suffixes.forEach(suf=>{
-      const rec = MEMORY.patterns[suf];
-      if (rec) {
-        rec.lastSeen = Date.now();
-        if (predictionShort === actualShort) rec.success = (rec.success||0) + 1;
-        else rec.fail = (rec.fail||0) + 1;
-        const tot = (rec.success||0) + (rec.fail||0);
-        rec.score = tot>0 ? (rec.success / tot) : rec.score || 0;
-        if ((rec.fail||0) >= MEMORY.settings.lockoutAfterFails) rec.lockedUntil = Date.now() + 1000*60*30;
-      }
-    });
-    const perf = MEMORY.stats.totalCorrect / Math.max(1, MEMORY.stats.totalPred);
-    const scale = 1 + (perf - 0.5) * 0.08;
-    MEMORY.weights.patternLookup = Math.max(0.4, (MEMORY.weights.patternLookup||1.0) * scale);
-    MEMORY.weights.fuzzyMatch = Math.max(0.4, (MEMORY.weights.fuzzyMatch||1.0) * (1 + (perf-0.5)*0.06));
-    await saveMemory();
-  } catch(e){ console.error("feedbackUpdate err", e.message||e); }
-}
-
-// ---------------- polling loop ----------------
-let pollingLock=false;
-async function updateLoop(){
-  if (pollingLock) return;
-  pollingLock = true;
-  try {
-    const remote = await fetchRemote();
-    if (!remote.length) return;
-    const newest = remote[0].phien;
-    const lastLocal = await getLatestPhienLocal();
-    if (newest > lastLocal) {
-      // push newest only
-      await pushHistory(remote[0]);
-      // update patterns throttle
-      const his = await getHistory();
-      const shouldUpdate = (his.length % MEMORY.settings.updatePatternEvery) === 0;
-      if (shouldUpdate) { updatePatternDB(his); await saveMemory(); }
-      // optionally run feedbackUpdate if you stored last prediction elsewhere
-    }
-  } catch(e){ console.error("updateLoop err", e.message||e); }
-  finally { pollingLock=false; }
-}
-setInterval(updateLoop, POLL_INTERVAL);
-updateLoop();
-
-// ---------------- routes ----------------
-app.get("/", (req,res)=> res.json({ status:"XENG16 SUPER HYBRID running", id:MY_ID }));
-
-app.get("/xocdia88", async (req,res)=>{
-  try {
-    const his = await getHistory();
-    if (!his.length) return res.json({ error: "History loading, wait few seconds" });
-    const cur = his[0];
-    const u = unifiedPredict(his);
-    const conv = v => v === "T" ? "Tài" : v === "X" ? "Xỉu" : v;
-    res.json({
-      id: MY_ID,
-      phien: cur.phien,
-      xuc_xac_1: cur.x1,
-      xuc_xac_2: cur.x2,
-      xuc_xac_3: cur.x3,
-      tong: cur.tong,
-      ket_qua: conv(cur.kq),
-      phien_hien_tai: cur.phien + 1,
-      du_doan: conv(u.prediction),
-      confidence: Math.round((u.confidence || 0) * 100),
-      reasons: u.reasons || []
-    });
-  } catch(e){ res.status(500).json({ error: e.message||e }); }
-});
-
-app.get("/his", async (req,res)=> res.json(await getHistory()));
-
-app.get("/debug", async (req,res)=>{
-  const mem = MEMORY;
-  const arr = Object.keys(mem.patterns).map(p => ({ p, ...mem.patterns[p] }));
-  arr.sort((a,b)=> ((b.score||0)*(b.count||0)) - ((a.score||0)*(a.count||0)));
-  res.json({
-    id: MY_ID,
-    memorySummary: { totalPatterns: Object.keys(mem.patterns).length, weights: mem.weights, stats: mem.stats },
-    topPatterns: arr.slice(0,40)
-  });
-});
-
-// ---------------- graceful persist ----------------
-async function persistAll(){ try{ await saveMemory(); } catch(e){ console.error(e); } }
-process.on("SIGINT", async ()=>{ await persistAll(); process.exit(0); });
-process.on("SIGTERM", async ()=>{ await persistAll(); process.exit(0); });
-
-// ---------------- init ----------------
-(async ()=>{
-  await loadMemory();
-  // if history empty, try one fetch to seed
-  const existing = await getHistory(1);
-  if (!existing.length) {
-    const remote = await fetchRemote(10);
-    if (remote.length) {
-      // push first few
-      for (let i = remote.length - 1; i >= 0; i--) {
-        await pushHistory(remote[i]);
-      }
-    }
-  }
-  console.log("Server ready. history len:", (await getHistory(5)).length);
-  app.listen(PORT, ()=> console.log(`XENG16-Redis listening on ${PORT}`));
-})();}
-
-// ---------------- V-Engine modules ----------------
-function detectMarketState(his) {
-  const window = Math.min(50, his.length);
-  if (window < 10) return "unknown";
-  const seq = seqNewestFirst(his, window);
-  let runs=1, last=seq[0];
-  for (let i=1;i<seq.length;i++){ if (seq[i]!==last){ runs++; last=seq[i]; } }
-  const runDensity = runs/seq.length;
-  if (runDensity < 0.15) return "trending";
-  if (runDensity > 0.5) return "volatile";
-  return "random";
-}
-
-function extractPatterns(his, minL, maxL) {
-  const seq = seqOldestFirst(his, 500);
-  const map = {};
-  for (let L=minL; L<=maxL; L++){
-    for (let i=0;i+L<=seq.length;i++){
-      const p = seq.slice(i,i+L);
-      if (!p) continue;
-      map[p] = (map[p]||0)+1;
-    }
-  }
-  return map;
-}
-
-function updatePatternDB(his) {
-  try {
-    const s = MEMORY.settings;
-    const counts = extractPatterns(his, s.patternMinLen, s.patternMaxLen);
-    Object.keys(counts).forEach(p=>{
-      const c = counts[p];
-      if (c >= s.minPatternOccurrences) {
-        if (!MEMORY.patterns[p]) MEMORY.patterns[p] = { count:c, success:0, fail:0, score:0, lastSeen:Date.now(), lockedUntil:0 };
-        else { MEMORY.patterns[p].count = Math.max(MEMORY.patterns[p].count, c); MEMORY.patterns[p].lastSeen = Date.now(); }
-      }
-    });
-    // prune
-    const keys = Object.keys(MEMORY.patterns);
-    if (keys.length > s.memoryKeepPatterns) {
-      const sorted = keys.sort((a,b)=> (MEMORY.patterns[b].count*(MEMORY.patterns[b].score+1)) - (MEMORY.patterns[a].count*(MEMORY.patterns[a].score+1)));
-      const keep = new Set(sorted.slice(0, s.memoryKeepPatterns));
-      Object.keys(MEMORY.patterns).forEach(k=>{ if (!keep.has(k)) delete MEMORY.patterns[k]; });
-    }
-  } catch(e){ console.error("updatePatternDB err", e.message||e); }
-}
-
-function patternLookupPredict(his) {
-  const tailLen = MEMORY.settings.patternMaxLen;
-  const recent = seqOldestFirst(his, tailLen+2);
-  const lastPart = recent.slice(-tailLen);
-  const candidates = {};
-  for (let p in MEMORY.patterns) {
-    if (lastPart.endsWith(p)) candidates[p] = MEMORY.patterns[p];
-  }
-  if (Object.keys(candidates).length===0) return null;
-  const hist = seqOldestFirst(his, 1000);
-  const tally = { T:0, X:0 };
-  Object.keys(candidates).forEach(p=>{
-    let idx=0;
-    while((idx = hist.indexOf(p, idx)) !== -1) {
-      const nextIdx = idx + p.length;
-      if (nextIdx < hist.length) {
-        const nxt = hist[nextIdx];
-        if (nxt==='T' || nxt==='X') tally[nxt] += 1 * (MEMORY.patterns[p].count || 1);
-      }
-      idx++;
-    }
-  });
-  const total = tally.T + tally.X;
-  if (total === 0) return null;
-  return { pred: tally.T >= tally.X ? "T":"X", conf: Math.max(tally.T, tally.X)/total, reason: `patternLookup T:${tally.T} X:${tally.X}` };
-}
-
-function fuzzyMatchPredict(his) {
-  const shortPat = seqOldestFirst(his, 15).slice(-15);
-  const longPat = seqOldestFirst(his, 200);
-  if (!shortPat || shortPat.length < 6 || !longPat) return null;
-  let best = { pct:0, match:"", idx:-1 };
-  const L = shortPat.length;
-  for (let i=0;i+L<=longPat.length;i++){
-    const slice = longPat.slice(i,i+L);
-    let same=0;
-    for (let j=0;j<L;j++) if (slice[j]===shortPat[j]) same++;
-    const pct = (same/L)*100;
-    if (pct > best.pct) best = { pct, match: slice, idx:i };
-  }
-  if (best.pct >= 80) {
-    const nextIdx = best.idx + L;
-    if (nextIdx < longPat.length) return { pred: longPat[nextIdx], conf: best.pct/100, reason: `fuzzy ${best.pct.toFixed(1)}%` };
-  }
-  return null;
-}
-
-function trendPredict(his) {
-  const window = Math.min(his.length,50);
-  if (window < 6) return null;
-  const seq = seqOldestFirst(his, window);
-  const t = (seq.match(/T/g)||[]).length;
-  const x = (seq.match(/X/g)||[]).length;
-  const total = t+x;
-  if (total===0) return null;
-  if (t/total > 0.6) return { pred:"T", conf:t/total, reason:`trend T ${t}/${total}` };
-  if (x/total > 0.6) return { pred:"X", conf:x/total, reason:`trend X ${x}/${total}` };
-  return null;
-}
-
-function momentumPredict(his) {
-  const seq = seqNewestFirst(his, 20);
-  if (!seq || seq.length < 4) return null;
-  const head = seq[0]; let streak=1;
-  for (let i=1;i<seq.length;i++){ if (seq[i]===head) streak++; else break; }
-  if (streak >=2 && streak <=4) return { pred: head, conf: 0.5 + (streak*0.1), reason:`momentum ${head} x${streak}` };
-  return null;
-}
-
-function powerRankPredict(his) {
-  const seq = seqOldestFirst(his, 100);
-  if (!seq || seq.length < 6) return null;
-  let scoreT=0, scoreX=0;
-  const b = seq.match(/T{4,}/) ? "T" : seq.match(/X{4,}/) ? "X" : null;
-  if (b==="T") scoreX += 8;
-  if (b==="X") scoreT += 8;
-  const tail6 = seq.slice(-6);
-  if (/^(TX|XT){3}$/.test(tail6)) {
-    const next = tail6[0]==='T'?'X':'T';
-    if (next==='T') scoreT += 6; else scoreX += 6;
-  }
-  const tcount = (seq.match(/T/g)||[]).length, xcount = (seq.match(/X/g)||[]).length;
-  if (tcount - xcount >= Math.ceil(seq.length*0.2)) scoreT += 4;
-  if (xcount - tcount >= Math.ceil(seq.length*0.2)) scoreX += 4;
-  let dbT=0, dbX=0;
-  for (let p in MEMORY.patterns) {
-    const rec = MEMORY.patterns[p];
-    if (!rec.count) continue;
-    const last = p[p.length-1];
-    if (last==='T') dbT += rec.count;
-    if (last==='X') dbX += rec.count;
-  }
-  if (dbT + dbX > 0) { if (dbT > dbX) scoreT += 2; else scoreX += 2; }
-  const pred = scoreT >= scoreX ? "T" : "X";
-  const conf = Math.min(0.98, Math.max(0.05, Math.abs(scoreT-scoreX)/(Math.abs(scoreT)+Math.abs(scoreX)+1)));
-  return { pred, conf, reason: `powerRank T:${scoreT} X:${scoreX}` };
-}
-
-// ---------------- Akira Module (pattern detectors + AI_BatBet + AI_BeBet) ----------------
-
-// detect common pattern types in newest-first string
-function detectPatterns(his) {
-  const seqNew = seqNewestFirst(his, 40); // newest-first
-  const out = { is121:false, is212:false, is22:false, is11:false, longBett:false, bHead:'', headLen:0 };
-  if (!seqNew || seqNew.length < 4) return out;
-  const head = seqNew[0];
-  let headLen=1;
-  for (let i=1;i<seqNew.length;i++){ if (seqNew[i]===head) headLen++; else break; }
-  out.bHead = head; out.headLen = headLen;
-  if (headLen >=4) out.longBett = true;
-  const s6 = seqNew.slice(0,6);
-  if (/^(TX|XT){3}$/.test(s6)) out.is11 = true;
-  // 2-2 detection
-  const s8 = seqNew.slice(0,8);
-  if (/^(TTXX|XXTT){2,}$/.test(s8)) out.is22 = true;
-  // 1-2-1 or 2-1-2 detection (basic)
-  // check pattern like T X X T (1-2-1)
-  if (seqNew[0] && seqNew[1] && seqNew[2] && seqNew[3]) {
-    const s4 = seqNew.slice(0,4);
-    if (s4[0] === s4[3] && s4[1] === s4[2] && s4[0] !== s4[1]) out.is121 = true;
-  }
-  // 2-1-2: T T X T T or X X T X X
-  const s5 = seqNew.slice(0,5);
-  if (s5.length===5 && s5[0]===s5[1] && s5[3]===s5[4] && s5[0]===s5[4] && s5[2]!==s5[0]) out.is212 = true;
-  return out;
-}
-
-// AI_BatBet: attempt to "ride" long bet when strong
-function aiBatBet(his) {
-  const pat = detectPatterns(his);
-  if (!pat.longBett) return null;
-  const head = pat.bHead;
-  // measure strength by headLen and historical follow-through
-  const headLen = pat.headLen;
-  // if headLen very long, expect gãy soon: safe strategy try opposite with low confidence
-  if (headLen >= 6) return { pred: head === "T" ? "X":"T", conf: 0.6 - Math.min(0.3, (headLen-6)*0.03), reason: `Akira: long bet gãy soon len=${headLen}` };
-  // if moderate (4-5) maybe still continue? decide by memory patterns counts
-  let followCount = 0, followTotal=0;
-  const seqOld = seqOldestFirst(his, 500);
-  const p = head.repeat(headLen);
-  let idx=0;
-  while((idx = seqOld.indexOf(p, idx)) !== -1) {
-    const nextIdx = idx + p.length;
-    if (nextIdx < seqOld.length) { followTotal++; if (seqOld[nextIdx]===head) followCount++; }
-    idx++;
-  }
-  if (followTotal>0 && (followCount/followTotal) > 0.5) {
-    return { pred: head, conf: 0.45 + Math.min(0.35, followCount/followTotal*0.4), reason: `Akira: batbet followRate ${(followCount/followTotal).toFixed(2)}` };
-  }
-  return { pred: head === "T" ? "X":"T", conf: 0.55, reason: "Akira: batbet default reverse" };
-}
-
-// AI_BeBet_LinhHoat: smart break bet
-function aiBeBet(his) {
-  const pat = detectPatterns(his);
-  if (!pat.longBett) return null;
-  const head = pat.bHead;
-  const headLen = pat.headLen;
-  // weaker long bets (len 4-5) -> break likely
-  if (headLen >= 4) {
-    // use patternDB evidence to decide what usually follows the repeated block
-    const hist = seqOldestFirst(his, 1000);
-    const p = head.repeat(headLen);
-    let idx=0, tT=0, tX=0;
-    while((idx = hist.indexOf(p, idx)) !== -1) {
-      const nxt = hist[idx + p.length];
-      if (nxt==='T') tT++; if (nxt==='X') tX++;
-      idx++;
-    }
-    if (tT + tX > 0) {
-      const pred = tT >= tX ? 'T' : 'X';
-      const conf = Math.max(0.55, Math.min(0.9, Math.max(tT,tX)/(tT+tX)));
-      return { pred, conf, reason: `Akira: bebet tally T:${tT} X:${tX}`};
-    }
-    return { pred: head === "T" ? "X":"T", conf: 0.6, reason: "Akira: bebet fallback break" };
-  }
-  return null;
-}
-
-// Akira ensemble wrapper
-function akiraPredict(his) {
-  // call detectors and submodels
-  const mod = [];
-  const bat = aiBatBet(his); if (bat) mod.push({name:"aiBatBet", ...bat, weight:1.0});
-  const beb = aiBeBet(his); if (beb) mod.push({name:"aiBeBet", ...beb, weight:1.2});
-  // add small heuristic detectors
-  const patterns = detectPatterns(his);
-  if (patterns.is11) mod.push({ name:"akira_is11", pred: seqNewestFirst(his,6)[0]==='T' ? 'X':'T', conf:0.45, reason:"akira detect 1-1", weight:0.8});
-  if (patterns.is22) mod.push({ name:"akira_is22", pred: seqNewestFirst(his,8)[0]==='T' ? 'X':'T', conf:0.6, reason:"akira detect 2-2", weight:1.0});
-  // majority fallback (short)
-  const seq = seqOldestFirst(his,20);
-  const t=(seq.match(/T/g)||[]).length, x=(seq.match(/X/g)||[]).length;
-  if (t!==x) mod.push({name:"akira_ratio", pred: t>x?'T':'X', conf: Math.abs(t-x)/20, reason:"akira ratio", weight:0.6});
-  if (!mod.length) return { prediction:"N/A", confidence:0, reasons:["akira no model"] };
-  // combine
-  let score = {T:0, X:0}; const reasons=[];
-  mod.forEach((m, idx)=>{
-    const w = (m.weight||1) * (MEMORY.weights.akira||1);
-    const conf = Math.min(0.99, Math.max(0.01, m.conf||0.5));
-    if (m.pred === 'T') score.T += w * conf; else if (m.pred === 'X') score.X += w * conf;
-    reasons.push(`${m.name}:${m.reason||''} (w=${w.toFixed(2)} conf=${conf.toFixed(2)})`);
-  });
-  const final = score.T >= score.X ? 'T':'X';
-  const conf = Math.max(0.01, Math.min(0.999, Math.max(score.T,score.X)/(score.T+score.X||1)));
-  return { prediction: final, confidence: conf, reasons };
-}
-
-// ---------------- V-Engine ensemble ----------------
-function vEnginePredict(his) {
-  const models = [];
-  const pl = patternLookupPredict(his); if (pl) models.push({n:"patternLookup", pred:pl.pred, conf:pl.conf, reason:pl.reason, weight: MEMORY.weights.patternLookup||1.2});
-  const fz = fuzzyMatchPredict(his); if (fz) models.push({n:"fuzzy", pred:fz.pred, conf:fz.conf, reason:fz.reason, weight: MEMORY.weights.fuzzyMatch||1.0});
-  const tr = trendPredict(his); if (tr) models.push({n:"trend", pred:tr.pred, conf:tr.conf, reason:tr.reason, weight: MEMORY.weights.trend||1.0});
-  const mo = momentumPredict(his); if (mo) models.push({n:"momentum", pred:mo.pred, conf:mo.conf, reason:mo.reason, weight: MEMORY.weights.momentum||1.0});
-  const pr = powerRankPredict(his); if (pr) models.push({n:"powerRank", pred:pr.pred, conf:pr.conf, reason:pr.reason, weight: MEMORY.weights.powerRank||1.0});
-  const oldm = oldSimplePredict(his); if (oldm && oldm.pred!=="N/A") models.push({n:"oldSimple", pred:oldm.pred, conf:0.6, reason:oldm.reason, weight: MEMORY.weights.oldSimple||0.8});
-  if (!models.length) return { prediction:"N/A", confidence:0, reasons:["no models"] };
-  let score={T:0, X:0}, reasons=[];
-  models.forEach(m=>{
-    const w = m.weight||1; const conf = Math.min(0.99, Math.max(0.01, m.conf||0.5));
-    if (m.pred === 'T') score.T += w*conf; else score.X += w*conf;
-    reasons.push(`${m.n}:${m.reason} (w=${w.toFixed(2)} conf=${conf.toFixed(2)})`);
-  });
-  const market = detectMarketState(his);
-  if (market === "volatile") { score.T *= 0.92; score.X *= 0.92; }
-  else if (market === "trending") { const bonus=1.06; score.T*=bonus; score.X*=bonus; }
-  const final = score.T >= score.X ? 'T':'X';
-  const conf = Math.max(0.01, Math.min(0.999, Math.max(score.T,score.X)/(score.T+score.X||1)));
-  return { prediction: final, confidence: conf, reasons };
-}
-
-// ---------------- unified predict (harmonize all engines) ----------------
-function unifiedPredict(his) {
-  // his newest-first
-  const v = vEnginePredict(his);
-  const a = akiraPredict(his);
-  const o = oldSimplePredict(his);
-
-  // blending factors
-  const alphaV = 0.45, alphaA = 0.35, alphaO = 0.2;
-  let score={T:0,X:0};
-  const reasons = [];
-
-  if (v && v.prediction!=="N/A") { score[v.prediction] += alphaV * ((v.confidence||v.conf||0.5) * (MEMORY.weights.powerRank||1)); if (v.reasons) reasons.push(...(v.reasons||[]).slice(0,3)); }
-  if (a && a.prediction!=="N/A") { score[a.prediction] += alphaA * (a.confidence||0.5) * (MEMORY.weights.akira||1); if (a.reasons) reasons.push(...(a.reasons||[]).slice(0,3)); }
-  if (o && o.pred!=="N/A") { score[o.pred] += alphaO * ((o.confidence||0.6) * (MEMORY.weights.oldSimple||0.8)); if (o.reason) reasons.push(o.reason); }
-
-  if (score.T === 0 && score.X === 0) {
-    if (o && o.pred) return { prediction: o.pred, confidence:0.5, reasons:[o.reason] };
-    return { prediction:"N/A", confidence:0, reasons:["no engines"] };
-  }
-  const final = score.T >= score.X ? 'T' : 'X';
-  const conf = Math.max(0.01, Math.min(0.999, Math.max(score.T,score.X)/(score.T+score.X||1)));
-  return { prediction: final, confidence: conf, reasons: reasons.slice(0,6) };
-}
-
-// ---------------- feedback learning ----------------
-async function feedbackUpdate(predictionShort, actualShort) {
-  try {
-    MEMORY.stats.totalPred = (MEMORY.stats.totalPred||0) + 1;
-    if (predictionShort === actualShort) MEMORY.stats.totalCorrect = (MEMORY.stats.totalCorrect||0) + 1;
-    // update patterns scores for suffix candidates
-    const his = await loadHistory();
-    const recent = seqOldestFirst(his, 20);
-    const suffixes = [];
-    for (let L=MEMORY.settings.patternMinLen; L<=Math.min(MEMORY.settings.patternMaxLen, recent.length); L++) suffixes.push(recent.slice(-L));
-    suffixes.forEach(suf=>{
-      const rec = MEMORY.patterns[suf];
-      if (rec) {
-        rec.lastSeen = Date.now();
-        if (predictionShort === actualShort) rec.success = (rec.success||0) + 1;
-        else rec.fail = (rec.fail||0) + 1;
-        const tot = (rec.success||0) + (rec.fail||0);
-        rec.score = tot>0 ? (rec.success / tot) : rec.score || 0;
-        if ((rec.fail||0) >= MEMORY.settings.lockoutAfterFails) rec.lockedUntil = Date.now() + 1000*60*30;
-      }
-    });
-    // light adapt weights based on overall perf
-    const perf = MEMORY.stats.totalCorrect / Math.max(1, MEMORY.stats.totalPred);
-    const scale = 1 + (perf - 0.5) * 0.08;
-    MEMORY.weights.patternLookup = Math.max(0.4, (MEMORY.weights.patternLookup||1.0) * scale);
-    MEMORY.weights.fuzzyMatch = Math.max(0.4, (MEMORY.weights.fuzzyMatch||1.0) * (1 + (perf-0.5)*0.06));
-    await saveJson(MEM_FILE, MEMORY);
-  } catch(e){ console.error("feedbackUpdate err", e.message||e); }
-}
-
-// ---------------- polling loop ----------------
-let pollingLock=false;
-async function updateLoop(){
-  if (pollingLock) return;
-  pollingLock = true;
-  try {
-    const remote = await fetchRemote();
-    if (!remote.length) return;
-    let his = await loadHistory();
-    const newest = remote[0].phien;
-    const lastLocal = his.length ? his[0].phien : 0;
-    if (newest > lastLocal) {
-      his.unshift(remote[0]);
-      if (his.length > MAX_HIS) his.length = MAX_HIS;
-      await saveHistory(his);
-      // update patterns throttle
-      const shouldUpdate = (his.length % MEMORY.settings.updatePatternEvery) === 0;
-      if (shouldUpdate) { updatePatternDB(his); await saveJson(MEM_FILE, MEMORY); }
-      // when new result arrives we can optionally perform feedback for previous prediction:
-      // If we stored last prediction somewhere (not stored now) we'd update. For simplicity, skip.
-    }
-  } catch(e){ console.error("updateLoop err", e.message||e); }
-  finally { pollingLock=false; }
-}
-setInterval(updateLoop, POLL_INTERVAL);
-updateLoop();
-
-// ---------------- routes ----------------
-app.get("/", (req,res)=> res.json({ status:"XENG16 SUPER HYBRID running", id:MY_ID }));
-
-app.get("/xocdia88", async (req,res)=>{
-  const his = await loadHistory();
-  if (!his.length) return res.json({ error: "History loading, wait few seconds" });
-  const cur = his[0];
-  const u = unifiedPredict(his);
-  const conv = v => v === "T" ? "Tài" : v === "X" ? "Xỉu" : v;
-  res.json({
-    id: MY_ID,
-    phien: cur.phien,
-    xuc_xac_1: cur.x1,
-    xuc_xac_2: cur.x2,
-    xuc_xac_3: cur.x3,
-    tong: cur.tong,
-    ket_qua: conv(cur.kq),
-    phien_hien_tai: cur.phien + 1,
-    du_doan: conv(u.prediction),
-    confidence: Math.round((u.confidence || 0) * 100),
-    reasons: u.reasons || []
-  });
-});
-
-app.get("/his", async (req,res)=> res.json(await loadHistory()));
-
-app.get("/debug", async (req,res)=>{
-  const mem = MEMORY;
-  const arr = Object.keys(mem.patterns).map(p => ({ p, ...mem.patterns[p] }));
-  arr.sort((a,b)=> ((b.score||0)*(b.count||0)) - ((a.score||0)*(a.count||0)));
-  res.json({
-    id: MY_ID,
-    memorySummary: { totalPatterns: Object.keys(mem.patterns).length, weights: mem.weights, stats: mem.stats },
-    topPatterns: arr.slice(0,40)
-  });
-});
-
-// ---------------- graceful persist ----------------
-async function persistAll(){ try{ await saveJson(MEM_FILE, MEMORY); } catch{} }
-process.on("SIGINT", async ()=>{ await persistAll(); process.exit(0); });
-process.on("SIGTERM", async ()=>{ await persistAll(); process.exit(0); });
-// ---------------- VIP CẦU TIENDAT (Custom Pattern Zone) ----------------
-// Dán cầu tự custom TẠI ĐÂY, muốn bao nhiêu cũng được.
-// Format: "pattern": "result"
-
-const VIP_CAU_TIENDAT = `
-	1. XTXXTXTTXXTTXX - X
+/* ================ VIP PATTERNS EMBED ================ */
+/*
+ Paste your full VIP file content (the large numbered list) between the backticks below.
+ Keep the exact format "NN. PATTERN - R" or "PATTERN - R" lines. Example:
+   1. XTXXTXTT - X
+   2. TXXTTT - T
+*/
+const VIP_PATTERNS_TEXT = `
+ 1. XTXXTXTTXXTTXX - X
 2. XXTXTTXXXTTXXT - X
 3. TXTXTTTXXTXXXT - T
 4. XXTXXTTXXXXTXT - X
@@ -10943,23 +10041,670 @@ const VIP_CAU_TIENDAT = `
 9998. TTXTXTXXXTXTXX - X
 9999. TXTTTTTTXXXXXX - T
 10000. TXXTTTXXTTTXTT - T
-`;
-  
-function vipCauPredict(his) {
-  const seq = seqOldestFirst(his, 50);
 
-  for (let pat in VIP_CAU_TIENDAT) {
-    if (seq.endsWith(pat)) {
-      return {
-        pred: VIP_CAU_TIENDAT[pat],
-        conf: 0.99,
-        reason: `VIP_CAU match "${pat}" => ${VIP_CAU_TIENDAT[pat]}`
-      };
+`; 
+
+/* ================ MEMORY DEFAULT =================== */
+const defaultMemory = {
+  patterns: {}, // pattern => { count, success, fail, score, lastSeen, vip, expected, aprStreak }
+  weights: {
+    oldSimple: 0.7,
+    patternLookup: 1.6,
+    fuzzyMatch: 1.0,
+    trend: 1.0,
+    momentum: 1.0,
+    powerRank: 1.2,
+    akira: 1.2,
+    vip: 1.0
+  },
+  stats: { totalPred: 0, totalCorrect: 0 },
+  settings: {
+    patternMinLen: 3,
+    patternMaxLen: 8,
+    minPatternOccurrences: 2,
+    lockoutAfterFails: 4,
+    memoryKeepPatterns: 4000,
+    updatePatternEvery: 10
+  },
+  marketProfile: {
+    // weights per market state (T / X multipliers on engines) - will be adjusted automatically by learning
+    states: {
+      "ultra_trending": { factor: 1.15 },
+      "semi_trending": { factor: 1.08 },
+      "low_volatile": { factor: 1.02 },
+      "high_volatile": { factor: 0.9 },
+      "balanced": { factor: 0.98 },
+      "reverse": { factor: 0.95 }
     }
+  }
+};
+let MEMORY = { ...defaultMemory };
+
+/* ================== REDIS HELPERS =================== */
+async function loadMemory() {
+  try {
+    const raw = await redis.get(MEM_KEY);
+    if (raw) {
+      MEMORY = JSON.parse(raw);
+      console.log("Loaded memory from redis - patterns:", Object.keys(MEMORY.patterns || {}).length);
+    } else {
+      MEMORY = { ...defaultMemory };
+      await saveMemory();
+      console.log("Initialized memory in redis");
+    }
+  } catch (e) {
+    console.error("loadMemory err", e.message || e);
+    MEMORY = { ...defaultMemory };
+  }
+}
+async function saveMemory() {
+  try {
+    await redis.set(MEM_KEY, JSON.stringify(MEMORY));
+  } catch (e) { console.error("saveMemory err", e.message || e); }
+}
+async function pushHistory(item) {
+  try {
+    await redis.lpush(HIS_KEY, JSON.stringify(item));
+    await redis.ltrim(HIS_KEY, 0, MAX_HIS - 1);
+  } catch (e) { console.error("pushHistory err", e.message || e); }
+}
+async function getHistory(limit = MAX_HIS) {
+  try {
+    const arr = await redis.lrange(HIS_KEY, 0, limit - 1);
+    return arr.map(s => {
+      try { return JSON.parse(s); } catch (e) { return null; }
+    }).filter(Boolean);
+  } catch (e) { console.error("getHistory err", e.message || e); return []; }
+}
+async function getLatestPhienLocal() {
+  try {
+    const raw = await redis.lindex(HIS_KEY, 0);
+    if (!raw) return 0;
+    const obj = JSON.parse(raw);
+    return Number(obj.phien || 0);
+  } catch (e) { return 0; }
+}
+
+/* =================== FETCH REMOTE =================== */
+async function fetchRemote(limit = 50) {
+  try {
+    const r = await axios.get(API_URL, { timeout: 7000 });
+    const arr = Array.isArray(r.data) ? r.data.slice(0, limit) : [];
+    return arr.map(e => ({
+      phien: Number(e.SessionId),
+      x1: Number(e.FirstDice),
+      x2: Number(e.SecondDice),
+      x3: Number(e.ThirdDice),
+      tong: Number(e.DiceSum),
+      kq: e.BetSide === 0 ? "T" : "X",
+      ts: Date.now()
+    }));
+  } catch (e) {
+    // graceful empty
+    return [];
+  }
+}
+
+/* =================== SEQUENCE HELPERS =================== */
+function seqNewestFirst(his, len = 500) { return his.slice(0, len).map(i => i.kq).join(""); }
+function seqOldestFirst(his, len = 500) { return his.slice(0, len).map(i => i.kq).reverse().join(""); }
+
+/* =================== PATTERN EXTRACT =================== */
+function extractPatterns(his, minL, maxL) {
+  const seq = seqOldestFirst(his, 1500);
+  const map = {};
+  for (let L = minL; L <= maxL; L++) {
+    for (let i = 0; i + L <= seq.length; i++) {
+      const p = seq.slice(i, i + L);
+      if (!p) continue;
+      map[p] = (map[p] || 0) + 1;
+    }
+  }
+  return map;
+}
+function updatePatternDB(his) {
+  try {
+    const s = MEMORY.settings;
+    const counts = extractPatterns(his, s.patternMinLen, s.patternMaxLen);
+    Object.keys(counts).forEach(p => {
+      const c = counts[p];
+      if (c >= s.minPatternOccurrences) {
+        if (!MEMORY.patterns[p]) MEMORY.patterns[p] = { count: c, success: 0, fail: 0, score: 0.5, lastSeen: Date.now(), lockedUntil: 0, vip: false, aprStreak: 0 };
+        else { MEMORY.patterns[p].count = Math.max(MEMORY.patterns[p].count || 0, c); MEMORY.patterns[p].lastSeen = Date.now(); }
+      }
+    });
+    // prune by combined metric
+    const keys = Object.keys(MEMORY.patterns);
+    if (keys.length > s.memoryKeepPatterns) {
+      const sorted = keys.sort((a, b) => ((MEMORY.patterns[b].count || 0) * ((MEMORY.patterns[b].score || 0) + 1)) - ((MEMORY.patterns[a].count || 0) * ((MEMORY.patterns[a].score || 0) + 1)));
+      const keep = new Set(sorted.slice(0, s.memoryKeepPatterns));
+      Object.keys(MEMORY.patterns).forEach(k => { if (!keep.has(k) && !MEMORY.patterns[k].vip) delete MEMORY.patterns[k]; });
+    }
+  } catch (e) { console.error("updatePatternDB err", e.message || e); }
+}
+
+/* ================== VIP PARSER (TEXT) ================== */
+function parseVipFromText(text) {
+  const lines = text.split(/\r?\n/);
+  const out = {};
+  for (let l of lines) {
+    l = l.trim();
+    if (!l) continue;
+    l = l.replace(/^\d+\.\s*/, ""); // remove numbering
+    const parts = l.split(/\s*-\s*/);
+    if (parts.length < 2) continue;
+    const pattern = parts[0].replace(/\s+/g, "").toUpperCase();
+    const res = parts[1].trim().toUpperCase().slice(0, 1);
+    if (!/^[TX]+$/.test(pattern)) continue;
+    if (res !== "T" && res !== "X") continue;
+    out[pattern] = res;
+  }
+  return out;
+}
+function loadVipFromTextAndInject(text) {
+  try {
+    const parsed = parseVipFromText(text);
+    let added = 0;
+    for (let p in parsed) {
+      const expected = parsed[p];
+      const rec = MEMORY.patterns[p] || {};
+      rec.count = Math.max(rec.count || 0, 50);
+      rec.score = Math.max(rec.score || 0.9, 0.9);
+      rec.success = rec.success || 0;
+      rec.fail = rec.fail || 0;
+      rec.lastSeen = Date.now();
+      rec.lockedUntil = 0;
+      rec.vip = true;
+      rec.expected = expected;
+      rec.aprStreak = rec.aprStreak || 0;
+      MEMORY.patterns[p] = rec;
+      added++;
+    }
+    if (added > 0) saveMemory().catch(() => { });
+    console.log("VIP load injected patterns:", added);
+    return added;
+  } catch (e) { console.error("loadVipFromText err", e.message || e); return 0; }
+}
+
+/* ============== PREDICTION MODULES =============== */
+function oldSimplePredict(his) {
+  if (!his || his.length < 8) return { pred: "N/A", reason: "bad data" };
+  const seq = his.slice(0, 20).map(i => i.kq).join("");
+  const head = seq[0];
+  const m = seq.match(new RegExp(`^${head}+`));
+  const streak = m ? m[0].length : 0;
+  if (streak >= 4) return { pred: head === "T" ? "X" : "T", conf: 0.6, reason: `streak ${head} x${streak}` };
+  const cT = (seq.match(/T/g) || []).length, cX = (seq.match(/X/g) || []).length;
+  if (Math.abs(cT - cX) >= 6) return { pred: cT > cX ? "T" : "X", conf: Math.min(0.85, Math.abs(cT - cX) / seq.length), reason: "ratio" };
+  return { pred: seq[0] === "T" ? "X" : "T", conf: 0.5, reason: "fallback" };
+}
+
+function patternLookupPredict(his) {
+  const tailLen = MEMORY.settings.patternMaxLen;
+  const recent = seqOldestFirst(his, tailLen + 2);
+  const lastPart = recent.slice(-tailLen);
+  const candidates = {};
+  for (let p in MEMORY.patterns) {
+    if (lastPart.endsWith(p)) candidates[p] = MEMORY.patterns[p];
+  }
+  if (Object.keys(candidates).length === 0) return null;
+  const hist = seqOldestFirst(his, 1000);
+  const tally = { T: 0, X: 0 };
+  Object.keys(candidates).forEach(p => {
+    let idx = 0;
+    while ((idx = hist.indexOf(p, idx)) !== -1) {
+      const nextIdx = idx + p.length;
+      if (nextIdx < hist.length) {
+        const nxt = hist[nextIdx];
+        if (nxt === 'T' || nxt === 'X') tally[nxt] += (MEMORY.patterns[p].count || 1);
+      }
+      idx++;
+    }
+  });
+  const total = tally.T + tally.X;
+  if (total === 0) return null;
+  return { pred: tally.T >= tally.X ? "T" : "X", conf: Math.max(tally.T, tally.X) / total, reason: `patternLookup T:${tally.T} X:${tally.X}` };
+}
+
+function fuzzyMatchPredict(his) {
+  const shortPat = seqOldestFirst(his, 15).slice(-15);
+  const longPat = seqOldestFirst(his, 400);
+  if (!shortPat || shortPat.length < 6 || !longPat) return null;
+  let best = { pct: 0, match: "", idx: -1 };
+  const L = shortPat.length;
+  for (let i = 0; i + L <= longPat.length; i++) {
+    const slice = longPat.slice(i, i + L);
+    let same = 0;
+    for (let j = 0; j < L; j++) if (slice[j] === shortPat[j]) same++;
+    const pct = (same / L) * 100;
+    if (pct > best.pct) best = { pct, match: slice, idx: i };
+  }
+  if (best.pct >= 78) {
+    const nextIdx = best.idx + L;
+    if (nextIdx < longPat.length) return { pred: longPat[nextIdx], conf: best.pct / 100, reason: `fuzzy ${best.pct.toFixed(1)}%` };
   }
   return null;
 }
-// ---------------- start ----------------
-app.listen(PORT, ()=> {
-  console.log(`🔥 XENG16 SUPER HYBRID running on port ${PORT} (id: ${MY_ID})`);
+
+function trendPredict(his) {
+  const window = Math.min(his.length, 80);
+  if (window < 6) return null;
+  const seq = seqOldestFirst(his, window);
+  const t = (seq.match(/T/g) || []).length;
+  const x = (seq.match(/X/g) || []).length;
+  const total = t + x;
+  if (total === 0) return null;
+  if (t / total > 0.62) return { pred: "T", conf: t / total, reason: `trend T ${t}/${total}` };
+  if (x / total > 0.62) return { pred: "X", conf: x / total, reason: `trend X ${x}/${total}` };
+  return null;
+}
+
+function momentumPredict(his) {
+  const seq = seqNewestFirst(his, 30);
+  if (!seq || seq.length < 4) return null;
+  const head = seq[0]; let streak = 1;
+  for (let i = 1; i < seq.length; i++) { if (seq[i] === head) streak++; else break; }
+  if (streak >= 2 && streak <= 6) return { pred: head, conf: 0.48 + (streak * 0.06), reason: `momentum ${head} x${streak}` };
+  return null;
+}
+
+function powerRankPredict(his) {
+  const seq = seqOldestFirst(his, 150);
+  if (!seq || seq.length < 8) return null;
+  let scoreT = 0, scoreX = 0;
+  if (seq.match(/T{5,}/)) scoreX += 8;
+  if (seq.match(/X{5,}/)) scoreT += 8;
+  const tail6 = seq.slice(-6);
+  if (/^(TX|XT){3}$/.test(tail6)) {
+    const next = tail6[0] === 'T' ? 'X' : 'T';
+    if (next === 'T') scoreT += 6; else scoreX += 6;
+  }
+  const tcount = (seq.match(/T/g) || []).length, xcount = (seq.match(/X/g) || []).length;
+  if (tcount - xcount >= Math.ceil(seq.length * 0.15)) scoreT += 4;
+  if (xcount - tcount >= Math.ceil(seq.length * 0.15)) scoreX += 4;
+  // pattern DB bias
+  let dbT = 0, dbX = 0;
+  for (let p in MEMORY.patterns) {
+    const rec = MEMORY.patterns[p];
+    if (!rec.count) continue;
+    const last = p[p.length - 1];
+    if (last === 'T') dbT += rec.count;
+    if (last === 'X') dbX += rec.count;
+  }
+  if (dbT + dbX > 0) { if (dbT > dbX) scoreT += 2; else scoreX += 2; }
+  const pred = scoreT >= scoreX ? "T" : "X";
+  const conf = Math.min(0.98, Math.max(0.05, Math.abs(scoreT - scoreX) / (Math.abs(scoreT) + Math.abs(scoreX) + 1)));
+  return { pred, conf, reason: `powerRank T:${scoreT} X:${scoreX}` };
+}
+
+/* ================= AKIRA (kept lean) ================= */
+function detectPatterns(his) {
+  const seqNew = seqNewestFirst(his, 40);
+  const out = { is121: false, is212: false, is22: false, is11: false, longBett: false, bHead: '', headLen: 0 };
+  if (!seqNew || seqNew.length < 4) return out;
+  const head = seqNew[0];
+  let headLen = 1;
+  for (let i = 1; i < seqNew.length; i++) { if (seqNew[i] === head) headLen++; else break; }
+  out.bHead = head; out.headLen = headLen;
+  if (headLen >= 4) out.longBett = true;
+  const s6 = seqNew.slice(0, 6);
+  if (/^(TX|XT){3}$/.test(s6)) out.is11 = true;
+  const s8 = seqNew.slice(0, 8);
+  if (/^(TTXX|XXTT){2,}$/.test(s8)) out.is22 = true;
+  const s4 = seqNew.slice(0, 4);
+  if (s4[0] === s4[3] && s4[1] === s4[2] && s4[0] !== s4[1]) out.is121 = true;
+  const s5 = seqNew.slice(0, 5);
+  if (s5.length === 5 && s5[0] === s5[1] && s5[3] === s5[4] && s5[0] === s5[4] && s5[2] !== s5[0]) out.is212 = true;
+  return out;
+}
+function akiraPredict(his) {
+  const mod = [];
+  const pat = detectPatterns(his);
+  if (pat.longBett) {
+    const head = pat.bHead;
+    if (pat.headLen >= 6) mod.push({ name: "akira_long_break", pred: head === "T" ? "X" : "T", conf: 0.6, weight: 1.0, reason: "batbet long" });
+    else mod.push({ name: "akira_bet", pred: head === "T" ? head : head, conf: 0.52, weight: 0.9, reason: "akira be/bat" });
+  }
+  if (pat.is11) mod.push({ name: "akira_is11", pred: seqNewestFirst(his, 6)[0] === 'T' ? 'X' : 'T', conf: 0.45, weight: 0.7, reason: "1-1" });
+  if (!mod.length) return { prediction: "N/A", confidence: 0, reasons: ["akira none"] };
+  let score = { T: 0, X: 0 }; const reasons = [];
+  mod.forEach(m => {
+    const w = (m.weight || 1) * (MEMORY.weights.akira || 1);
+    const conf = Math.min(0.99, Math.max(0.01, m.conf || 0.5));
+    if (m.pred === 'T') score.T += w * conf; else score.X += w * conf;
+    reasons.push(`${m.name}:${m.reason}`);
+  });
+  const final = score.T >= score.X ? 'T' : 'X';
+  const conf = Math.max(0.01, Math.min(0.999, Math.max(score.T, score.X) / (score.T + score.X || 1)));
+  return { prediction: final, confidence: conf, reasons };
+}
+
+/* =================== VIP PREDICT =================== */
+function vipPredict(his) {
+  try {
+    const tailLen = MEMORY.settings.patternMaxLen;
+    const recent = seqOldestFirst(his, tailLen + 2);
+    const lastPart = recent.slice(-tailLen);
+    // direct suffix match prioritized
+    for (let L = tailLen; L >= MEMORY.settings.patternMinLen; L--) {
+      const suf = lastPart.slice(-L);
+      const rec = MEMORY.patterns[suf];
+      if (rec && rec.vip && rec.expected) {
+        const conf = Math.min(0.99, (rec.score || 0.9) * Math.min(1, (rec.count || 50) / 50) * (1 + (rec.aprStreak || 0) * 0.02));
+        return { pred: rec.expected, conf, reason: `vip suffix ${suf}` };
+      }
+    }
+    // fuzzy VIP matching
+    const cur = seqOldestFirst(his, 40).slice(-15);
+    let bestPct = 0, bestPred = null, bestPat = null;
+    for (let p in MEMORY.patterns) {
+      const rec = MEMORY.patterns[p];
+      if (!rec.vip) continue;
+      const L = Math.min(p.length, cur.length);
+      let same = 0;
+      for (let i = 0; i < L; i++) if (p[p.length - L + i] === cur[cur.length - L + i]) same++;
+      const pct = same / L;
+      if (pct > bestPct) { bestPct = pct; bestPred = rec.expected; bestPat = p; }
+    }
+    if (bestPct >= 0.72 && bestPred) return { pred: bestPred, conf: 0.48 + bestPct * 0.4, reason: `vip fuzzy ${Math.round(bestPct * 100)}% pat:${bestPat}` };
+    return null;
+  } catch (e) { console.error("vipPredict err", e); return null; }
+}
+
+/* ============== RECURSIVE PATTERN PROJECTION (RPP) ============== */
+/*
+  Idea: take recent suffix S, find similar contexts historically, collect what followed them,
+  weight by similarity and recency, return aggregate projection.
+*/
+function recursivePatternProjection(his, suffixLen = 6, lookBack = 1000) {
+  try {
+    const hist = seqOldestFirst(his, lookBack + suffixLen);
+    const cur = hist.slice(-suffixLen);
+    if (!cur || cur.length < 3) return null;
+    const tally = { T: 0, X: 0 };
+    // search historical windows of same length
+    for (let i = 0; i + suffixLen < hist.length; i++) {
+      const slice = hist.slice(i, i + suffixLen);
+      // similarity (character match)
+      let same = 0;
+      for (let j = 0; j < suffixLen; j++) if (slice[j] === cur[j]) same++;
+      const sim = same / suffixLen;
+      if (sim >= 0.6) {
+        const next = hist[i + suffixLen];
+        if (next === 'T' || next === 'X') {
+          // weight by similarity and recency (recent hits more important)
+          const recencyFactor = 1 - (i / hist.length);
+          const w = sim * (0.4 + 0.6 * recencyFactor);
+          tally[next] += w;
+        }
+      }
+    }
+    const total = tally.T + tally.X;
+    if (total === 0) return null;
+    const pred = tally.T >= tally.X ? 'T' : 'X';
+    return { pred, conf: Math.min(0.98, Math.max(0.05, Math.max(tally.T, tally.X) / total)), reason: `RPP sim projection` };
+  } catch (e) { return null; }
+}
+
+/* ================= MARKET PROFILE (6 STATES) ============= */
+function classifyMarketState(his) {
+  // compute run density, streaks, entropy-ish metric
+  const window = Math.min(200, his.length);
+  if (window < 16) return "balanced";
+  const seq = seqNewestFirst(his, window);
+  // runs density
+  let runs = 1, last = seq[0];
+  for (let i = 1; i < seq.length; i++) {
+    if (seq[i] !== last) { runs++; last = seq[i]; }
+  }
+  const runDensity = runs / seq.length; // high => volatile
+  // average streak length
+  const streaks = [];
+  last = seq[0]; let curLen = 1;
+  for (let i = 1; i < seq.length; i++) {
+    if (seq[i] === last) curLen++; else { streaks.push(curLen); curLen = 1; last = seq[i]; }
+  }
+  streaks.push(curLen);
+  const avgStreak = streaks.reduce((a, b) => a + b, 0) / streaks.length;
+  const tcount = (seq.match(/T/g) || []).length, xcount = (seq.match(/X/g) || []).length;
+  const balance = Math.abs(tcount - xcount) / seq.length; // 0..1
+
+  // heuristics to 6 states
+  if (avgStreak >= 8 && balance > 0.25) return "ultra_trending";
+  if (avgStreak >= 5 && balance > 0.12) return "semi_trending";
+  if (runDensity > 0.6) return "high_volatile";
+  if (runDensity > 0.45) return "low_volatile";
+  if (balance < 0.06 && runDensity < 0.35) return "balanced";
+  // detect reverse phase (lots of alternating)
+  if (avgStreak <= 2 && runDensity > 0.55) return "reverse";
+  return "balanced";
+}
+
+/* ============== RISK CONTROL LAYER ============== */
+/*
+  If market state is risky (high_volatile or reverse) or model disagreements high => avoid hard predictions.
+*/
+function riskControlShouldSkip(his, ensembleConf) {
+  const state = classifyMarketState(his);
+  if (state === "high_volatile" || state === "reverse") return { skip: true, reason: `market ${state}` };
+  if (!ensembleConf || ensembleConf < 0.28) return { skip: true, reason: "low ensemble confidence" };
+  return { skip: false };
+}
+
+/* =================== V-ENGINE & ENSEMBLE =================== */
+function vEnginePredict(his) {
+  const models = [];
+  const pl = patternLookupPredict(his); if (pl) models.push({ n: "patternLookup", pred: pl.pred, conf: pl.conf, reason: pl.reason, weight: MEMORY.weights.patternLookup || 1.0 });
+  const fz = fuzzyMatchPredict(his); if (fz) models.push({ n: "fuzzy", pred: fz.pred, conf: fz.conf, reason: fz.reason, weight: MEMORY.weights.fuzzyMatch || 1.0 });
+  const tr = trendPredict(his); if (tr) models.push({ n: "trend", pred: tr.pred, conf: tr.conf, reason: tr.reason, weight: MEMORY.weights.trend || 1.0 });
+  const mo = momentumPredict(his); if (mo) models.push({ n: "momentum", pred: mo.pred, conf: mo.conf, reason: mo.reason, weight: MEMORY.weights.momentum || 1.0 });
+  const pr = powerRankPredict(his); if (pr) models.push({ n: "powerRank", pred: pr.pred, conf: pr.conf, reason: pr.reason, weight: MEMORY.weights.powerRank || 1.0 });
+  const oldm = oldSimplePredict(his); if (oldm && oldm.pred !== "N/A") models.push({ n: "oldSimple", pred: oldm.pred, conf: oldm.conf || 0.5, reason: oldm.reason, weight: MEMORY.weights.oldSimple || 0.7 });
+
+  if (!models.length) return { prediction: "N/A", confidence: 0, reasons: ["no models"] };
+
+  let score = { T: 0, X: 0 }, reasons = [];
+  const marketState = classifyMarketState(his);
+  const marketFactor = MEMORY.marketProfile.states[marketState] ? MEMORY.marketProfile.states[marketState].factor || 1 : 1;
+
+  models.forEach(m => {
+    const w = (m.weight || 1) * marketFactor;
+    const conf = Math.min(0.99, Math.max(0.01, m.conf || 0.5));
+    if (m.pred === 'T') score.T += w * conf; else score.X += w * conf;
+    reasons.push(`${m.n}:${m.reason}`);
+  });
+
+  const final = score.T >= score.X ? 'T' : 'X';
+  const conf = Math.max(0.01, Math.min(0.999, Math.max(score.T, score.X) / (score.T + score.X || 1)));
+  return { prediction: final, confidence: conf, reasons, marketState };
+}
+
+/* =================== UNIFIED PREDICT (with VIP influence) =================== */
+function unifiedPredict(his) {
+  // base engines
+  const v = vEnginePredict(his);
+  const a = akiraPredict(his);
+  const o = oldSimplePredict(his);
+
+  // combine base engines into baseScore
+  let baseScore = { T: 0, X: 0 }, baseReasons = [];
+  // vEngine larger share of base
+  if (v && v.prediction !== "N/A") { baseScore[v.prediction] += 0.55 * (v.confidence || v.conf || 0.5); baseReasons.push(...(v.reasons || []).slice(0, 3)); }
+  if (a && a.prediction !== "N/A") { baseScore[a.prediction] += 0.30 * (a.confidence || 0.5); baseReasons.push(...(a.reasons || []).slice(0, 2)); }
+  if (o && o.pred !== "N/A") { baseScore[o.pred] += 0.15 * (o.conf || 0.5); baseReasons.push(o.reason || "oldSimple"); }
+
+  // ensure baseScore scaled to BASE_ENGINE_PORTION
+  baseScore.T *= BASE_ENGINE_PORTION;
+  baseScore.X *= BASE_ENGINE_PORTION;
+
+  // VIP contribution
+  const vip = vipPredict(his);
+  if (vip && vip.pred) {
+    const vipConf = Math.min(0.99, Math.max(0.01, vip.conf || 0.8));
+    if (vip.pred === 'T') baseScore.T += VIP_INFLUENCE * vipConf;
+    else baseScore.X += VIP_INFLUENCE * vipConf;
+    baseReasons.push(`VIP:${vip.reason}(${(vipConf * 100).toFixed(0)}%)`);
+  } else {
+    // if no VIP match, optionally use RPP as substitute influence (small)
+    const rpp = recursivePatternProjection(his, 6, 1200);
+    if (rpp && rpp.pred) {
+      const rppConf = Math.min(0.85, Math.max(0.05, rpp.conf || 0.5));
+      if (rpp.pred === 'T') baseScore.T += (VIP_INFLUENCE * 0.35) * rppConf;
+      else baseScore.X += (VIP_INFLUENCE * 0.35) * rppConf;
+      baseReasons.push(`RPP:${rpp.reason}`);
+    }
+  }
+
+  // final ensemble
+  const final = baseScore.T >= baseScore.X ? 'T' : 'X';
+  const conf = Math.max(0.01, Math.min(0.999, Math.max(baseScore.T, baseScore.X) / (baseScore.T + baseScore.X || 1)));
+
+  // risk control: may skip prediction
+  const rc = riskControlShouldSkip(his, conf);
+  if (rc.skip) {
+    return { prediction: "N/A", confidence: conf, reasons: [...baseReasons, `risk:${rc.reason}`] };
+  }
+  return { prediction: final, confidence: conf, reasons: baseReasons.slice(0, 6) };
+}
+
+/* =================== FEEDBACK + APR (Auto-Pattern Reinforcement) =================== */
+async function feedbackUpdate(predictionShort, actualShort) {
+  try {
+    MEMORY.stats.totalPred = (MEMORY.stats.totalPred || 0) + 1;
+    if (predictionShort === actualShort) MEMORY.stats.totalCorrect = (MEMORY.stats.totalCorrect || 0) + 1;
+    // update suffix patterns performance and APR streaks
+    const his = await getHistory();
+    const recent = seqOldestFirst(his, 30);
+    const suffixes = [];
+    for (let L = MEMORY.settings.patternMinLen; L <= Math.min(MEMORY.settings.patternMaxLen, recent.length); L++) suffixes.push(recent.slice(-L));
+    suffixes.forEach(suf => {
+      const rec = MEMORY.patterns[suf];
+      if (rec) {
+        rec.lastSeen = Date.now();
+        if (predictionShort === actualShort) { rec.success = (rec.success || 0) + 1; rec.aprStreak = (rec.aprStreak || 0) + 1; }
+        else { rec.fail = (rec.fail || 0) + 1; rec.aprStreak = 0; }
+        const tot = (rec.success || 0) + (rec.fail || 0);
+        rec.score = tot > 0 ? (rec.success / tot) : rec.score || 0.5;
+        // APR discrete boost/penalty
+        if (rec.aprStreak >= 2) rec.score = Math.min(APR_MAX_SCORE, rec.score + APR_BOOST_STEP * rec.aprStreak);
+        if (rec.fail && rec.fail >= 2) rec.score = Math.max(0, rec.score - APR_PENALTY_STEP * rec.fail);
+        // lock out if failing too often
+        if ((rec.fail || 0) >= MEMORY.settings.lockoutAfterFails) rec.lockedUntil = Date.now() + 1000 * 60 * 30;
+      }
+    });
+    // adaptive weight tuning: small tweaks
+    const perf = MEMORY.stats.totalCorrect / Math.max(1, MEMORY.stats.totalPred);
+    // nudge weights slightly toward better engines (simple heuristic)
+    if (perf > 0.55) {
+      MEMORY.weights.patternLookup = Math.min(3, (MEMORY.weights.patternLookup || 1) * (1 + (perf - 0.5) * 0.02));
+      MEMORY.weights.akira = Math.min(2.5, (MEMORY.weights.akira || 1) * (1 + (perf - 0.5) * 0.015));
+    } else {
+      MEMORY.weights.patternLookup = Math.max(0.6, (MEMORY.weights.patternLookup || 1) * (1 - (0.52 - perf) * 0.03));
+    }
+    await saveMemory();
+  } catch (e) { console.error("feedbackUpdate err", e.message || e); }
+}
+
+/* ================= POLLING LOOP (seed & update) ================= */
+let pollingLock = false;
+async function updateLoop() {
+  if (pollingLock) return;
+  pollingLock = true;
+  try {
+    const remote = await fetchRemote();
+    if (!remote.length) return;
+    const newest = remote[0].phien;
+    const lastLocal = await getLatestPhienLocal();
+    if (newest > lastLocal) {
+      // push newest (may be multiple)
+      for (let i = 0; i < remote.length; i++) {
+        if (remote[i].phien > lastLocal) await pushHistory(remote[i]);
+      }
+      // periodic pattern DB updates
+      const his = await getHistory();
+      if ((his.length % MEMORY.settings.updatePatternEvery) === 0) { updatePatternDB(his); await saveMemory(); }
+    }
+  } catch (e) { console.error("updateLoop err", e.message || e); }
+  finally { pollingLock = false; }
+}
+setInterval(updateLoop, POLL_INTERVAL);
+updateLoop();
+
+/* =================== ROUTES =================== */
+app.get("/", (req, res) => res.json({ status: "XENG17 SUPREME running", id: MY_ID }));
+
+app.get("/xocdia88", async (req, res) => {
+  try {
+    const his = await getHistory();
+    if (!his.length) return res.json({ error: "History loading, wait few seconds" });
+    const cur = his[0];
+    const u = unifiedPredict(his);
+    const conv = v => v === "T" ? "Tài" : v === "X" ? "Xỉu" : v;
+    res.json({
+      id: MY_ID,
+      phien: cur.phien,
+      xuc_xac_1: cur.x1,
+      xuc_xac_2: cur.x2,
+      xuc_xac_3: cur.x3,
+      tong: cur.tong,
+      ket_qua: conv(cur.kq),
+      phien_hien_tai: cur.phien + 1,
+      du_doan: conv(u.prediction),
+      confidence: Math.round((u.confidence || 0) * 100),
+      reasons: u.reasons || []
+    });
+  } catch (e) { res.status(500).json({ error: e.message || e }); }
 });
+
+app.get("/his", async (req, res) => res.json(await getHistory()));
+
+app.get("/debug", async (req, res) => {
+  const mem = MEMORY;
+  const arr = Object.keys(mem.patterns || {}).map(p => ({ p, ...mem.patterns[p] }));
+  arr.sort((a, b) => ((b.score || 0) * (b.count || 0)) - ((a.score || 0) * (a.count || 0)));
+  res.json({
+    id: MY_ID,
+    memorySummary: { totalPatterns: Object.keys(mem.patterns || {}).length, weights: mem.weights, stats: mem.stats },
+    topPatterns: arr.slice(0, 60),
+    marketSample: classifyMarketState(await getHistory(200))
+  });
+});
+
+/* Admin: reload VIP content embedded */
+app.get("/admin/reload-vip", async (req, res) => {
+  try {
+    const n = loadVipFromTextAndInject(VIP_PATTERNS_TEXT);
+    await saveMemory();
+    res.json({ loaded: n });
+  } catch (e) { res.status(500).json({ error: e.message || e }); }
+});
+
+/* Admin: wipe history (danger) */
+app.post("/admin/wipe-history", async (req, res) => {
+  try {
+    await redis.del(HIS_KEY);
+    res.json({ ok: true });
+  } catch (e) { res.status(500).json({ error: e.message || e }); }
+});
+
+/* Graceful persist */
+async function persistAll() { try { await saveMemory(); } catch (e) { console.error(e); } }
+process.on("SIGINT", async () => { await persistAll(); process.exit(0); });
+process.on("SIGTERM", async () => { await persistAll(); process.exit(0); });
+
+/* ================ INIT ================ */
+(async () => {
+  await loadMemory();
+  // inject VIP from embedded text
+  loadVipFromTextAndInject(VIP_PATTERNS_TEXT);
+  // seed history if empty
+  const existing = await getHistory(1);
+  if (!existing.length) {
+    const remote = await fetchRemote(10);
+    if (remote.length) {
+      for (let i = remote.length - 1; i >= 0; i--) await pushHistory(remote[i]);
+    }
+  }
+  console.log("Server ready. history len:", (await getHistory(5)).length);
+  app.listen(PORT, () => console.log(`XENG17 listening on ${PORT}`));
+})();
