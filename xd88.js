@@ -1,7 +1,7 @@
 const express = require("express");
 const axios = require("axios");
 const cors = require("cors");
-const mongoose = require("mongoose"); // <-- Thay thế @upstash/redis bằng mongoose
+const mongoose = require("mongoose"); // <-- SỬ DỤNG MONGOOSE
 
 const app = express();
 app.use(cors());
@@ -12,6 +12,7 @@ const PORT = process.env.PORT || 3000;
 const MY_ID = process.env.MY_ID || "tiendat";
 const API_URL = process.env.API_URL || "https://taixiu.system32-cloudfare-356783752985678522.monster/api/luckydice/GetSoiCau";
 const MAX_HIS = Number(process.env.MAX_HIS) || 1000;
+// Tăng thời gian polling mặc định từ 8000ms lên 30000ms để tiết kiệm Redis requests
 const POLL_INTERVAL = Number(process.env.POLL_INTERVAL_MS) || 30000; 
 const VIP_INFLUENCE = Number(process.env.VIP_INFLUENCE) || 0.40;
 const BASE_ENGINE_PORTION = Math.max(0, 1 - VIP_INFLUENCE);
@@ -53,7 +54,6 @@ const History = mongoose.model('History', HistorySchema);
 
 /* ================ Core structures (In-Memory Cache) ================ */
 let memory = {
-    // Lưu trữ tạm thời tất cả patterns đã load từ DB để tính toán nhanh
     patterns: {}, 
     weights: { "1": 0.5, "2": 0.5 }, 
     stats: { total: 0, learned: 0, matched: 0, hits: 0, fails: 0, vip: 0 },
@@ -77,6 +77,7 @@ async function connectToMongo() {
         return true;
     } catch (e) {
         console.error("CRITICAL MONGO ERROR: Failed to connect to MongoDB:", e.message);
+        isPersistenceFailed = true;
         return false;
     }
 }
@@ -94,7 +95,6 @@ async function loadMemory() {
             memory.weights = globalMem.weights;
             memory.stats = globalMem.stats;
         } else {
-            // Create initial global memory document
             await new GlobalMemory({ _id: MY_ID + ":global" }).save();
         }
 
@@ -124,12 +124,11 @@ async function saveMemory() {
             { upsert: true }
         );
         
-        // 2. Save/Update all Patterns (chỉ lưu những pattern đang có trong RAM)
+        // 2. Save/Update all Patterns 
         const updatePromises = Object.entries(memory.patterns).map(([key, p]) => {
-             // Sử dụng upsert để tạo mới nếu chưa có, hoặc update nếu đã có
             return Pattern.updateOne(
                 { _id: key },
-                { $set: { ...p, _id: key } }, // Ghi đè toàn bộ dữ liệu pattern
+                { $set: { ...p, _id: key } }, 
                 { upsert: true }
             );
         });
@@ -146,14 +145,12 @@ async function saveMemory() {
 async function getHistory(limit) {
     if (!isMongoReady || isPersistenceFailed) return [];
     try {
-        // Lấy kết quả mới nhất (timestamp giảm dần)
         const historyDocs = await History.find()
             .sort({ timestamp: -1 }) 
             .limit(limit)
             .select('result -_id')
             .lean();
         
-        // Chuyển đổi từ [{ result: 't' }, { result: 'x' }] sang ['t', 'x']
         return historyDocs.map(doc => doc.result);
     } catch (e) {
         console.error("Failed to get history from MongoDB.", e.message);
@@ -162,27 +159,30 @@ async function getHistory(limit) {
 }
 
 async function setHistory(data) {
-    if (!isMongoReady || isPersistenceFailed) return;
+    if (!isMongoReady) return false; 
+    if (isPersistenceFailed) return false;
+
     try {
         // 1. Add new entry
-        await History.create({ result: data });
+        await History.create({ result: data }); 
         
-        // 2. Trim old entries (mimic ZREMRANGEBYRANK)
-        // Tìm bản ghi MAX_HIS + 1 (cái đầu tiên cần xóa)
+        // 2. Trim old entries (cắt tỉa)
         const oldestRecords = await History.find()
             .sort({ timestamp: 1 }) // Sắp xếp theo thứ tự cũ nhất
-            .skip(MAX_HIS) // Bỏ qua MAX_HIS bản ghi mới nhất
+            .skip(MAX_HIS) 
             .limit(1)
             .lean();
 
         if (oldestRecords.length > 0) {
             const cutOffTime = oldestRecords[0].timestamp;
-            // Xóa tất cả các bản ghi cũ hơn bản ghi giới hạn
             await History.deleteMany({ timestamp: { $lt: cutOffTime } });
         }
-
+        return true; // Báo cáo thành công
     } catch (e) {
-        console.error("Failed to set history to MongoDB.", e.message);
+        // CRITICAL: Ghi nhật ký lỗi chi tiết để tìm nguyên nhân
+        console.error("CRITICAL MongoDB Set History Error:", e.message, "--- Data attempting to save:", data);
+        isPersistenceFailed = true; 
+        return false; // Báo cáo thất bại
     }
 }
 
@@ -193,17 +193,6 @@ function getPattern(historyArr, length) {
     return historyArr.slice(0, length).join("");
 }
 
-function normalizeWeights(weights) {
-    const total = Object.values(weights).reduce((a, b) => a + b, 0);
-    if (total === 0) return weights;
-    const normalized = {};
-    for (const key in weights) {
-        normalized[key] = weights[key] / total;
-    }
-    return normalized;
-}
-
-// 0 - fail, 1 - win
 function updatePatternScore(patternKey, result) {
     if (!memory.patterns[patternKey]) return;
 
@@ -250,7 +239,7 @@ function learn(history) {
     memory.stats.total++;
 }
 
-/* ================ Engine Logic (Giữ nguyên) ================ */
+/* ================ Engine Logic ================ */
 
 function classifyMarketState(history) {
     if (history.length === 0) return 0;
@@ -345,27 +334,31 @@ function predictNext(currentHistory) {
     };
 }
 
-/* ================ API Polling and Learning ================ */
+/* ================ API Polling and Learning (Cập nhật Log) ================ */
 
 async function pollApiAndLearn() {
     try {
         const response = await axios.get(API_URL);
         const data = response.data.data;
-        if (!data || data.length === 0) return;
+        if (!data || data.length === 0) {
+             console.warn("API Polling Warning: API returned no data or empty array.");
+             return;
+        }
 
         const results = data.map(item => item.betType === 1 ? 't' : 'x');
 
-        // 1. Learn from previous results
-        learn(results);
+        // 1. Learn from previous results (Cập nhật trong RAM)
+        learn(results); 
 
         // 2. Save the new history
         const latestResult = results[0];
-        await setHistory(latestResult);
-
+        const historySaveSuccess = await setHistory(latestResult); // Lấy trạng thái lưu
+        
         // 3. Save memory (patterns và stats)
         await saveMemory();
 
-        console.log(`[${new Date().toLocaleTimeString()}] Polled API: Latest=${latestResult}, Learned=${memory.stats.learned}`);
+        // Ghi nhật ký chi tiết trạng thái lưu lịch sử
+        console.log(`[${new Date().toLocaleTimeString()}] Polled API: Latest=${latestResult}, Learned=${memory.stats.learned}, History Saved=${historySaveSuccess}`);
 
     } catch (error) {
         console.error("Error during API polling:", error.message || error);
@@ -374,7 +367,7 @@ async function pollApiAndLearn() {
 
 // ====================== VIP Pattern injection ======================
 const VIP_PATTERNS_TEXT = `
-  1. XTXXTXTTXXTTXX - X
+1. XTXXTXTTXXTTXX - X
 2. XXTXTTXXXTTXXT - X
 3. TXTXTTTXXTXXXT - T
 4. XXTXXTTXXXXTXT - X
@@ -10403,7 +10396,7 @@ function loadVipFromTextAndInject(text) {
 }
 
 
-/* ================ API Endpoints (Giữ nguyên) ================ */
+/* ================ API Endpoints ================ */
 
 app.get("/", (req, res) => {
     res.json({ status: "ok", service: MY_ID, uptime: process.uptime() });
@@ -10498,7 +10491,6 @@ async function pollApiLoop() {
     
     loadVipFromTextAndInject(VIP_PATTERNS_TEXT);
     
-    // Nếu kết nối Mongo bị lỗi, getHistory sẽ trả về rỗng, vẫn cần fetch
     const existing = await getHistory(1);
     if (!existing || existing.length === 0) {
         console.log("History is empty, fetching initial data...");
