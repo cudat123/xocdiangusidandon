@@ -1,7 +1,7 @@
 const express = require("express");
 const axios = require("axios");
 const cors = require("cors");
-const { Redis } = require("@upstash/redis");
+const mongoose = require("mongoose"); // <-- Thay thế @upstash/redis bằng mongoose
 
 const app = express();
 app.use(cors());
@@ -12,116 +12,181 @@ const PORT = process.env.PORT || 3000;
 const MY_ID = process.env.MY_ID || "tiendat";
 const API_URL = process.env.API_URL || "https://taixiu.system32-cloudfare-356783752985678522.monster/api/luckydice/GetSoiCau";
 const MAX_HIS = Number(process.env.MAX_HIS) || 1000;
-// Tăng thời gian polling mặc định từ 8000ms lên 30000ms để tiết kiệm Redis requests
 const POLL_INTERVAL = Number(process.env.POLL_INTERVAL_MS) || 30000; 
-const VIP_INFLUENCE = Number(process.env.VIP_INFLUENCE) || 0.40; // VIP weight portion (default 0.40)
-const BASE_ENGINE_PORTION = Math.max(0, 1 - VIP_INFLUENCE); // rest assigned to other engines
-const APR_BOOST_STEP = 0.06; // how much to boost pattern.score on consecutive wins
-const APR_PENALTY_STEP = 0.05; // penalty on fails
-const APR_MAX_SCORE = 1.5; // cap multiplier
+const VIP_INFLUENCE = Number(process.env.VIP_INFLUENCE) || 0.40;
+const BASE_ENGINE_PORTION = Math.max(0, 1 - VIP_INFLUENCE);
+const APR_BOOST_STEP = 0.06;
+const APR_PENALTY_STEP = 0.05;
+const APR_MAX_SCORE = 1.5;
 const APR_MIN_SCORE = 0.1;
 /* ================================================== */
 
-/* ================ Upstash Redis client ============== */
+/* ================ Mongoose Models ============== */
 
-let redis;
-let isRedisReady = false;
+let isMongoReady = false;
 
-if (!process.env.UPSTASH_REDIS_REST_URL || !process.env.UPSTASH_REDIS_REST_TOKEN) {
-    console.error("==========================================================================");
-    console.error("WARNING: Missing UPSTASH_REDIS_REST_URL or UPSTASH_REDIS_REST_TOKEN env vars.");
-    console.error("Application will run, but persistence and learning via Redis will be disabled (or fail).");
-    console.error("==========================================================================");
-} else {
-    try {
-        redis = new Redis({
-            url: process.env.UPSTASH_REDIS_REST_URL,
-            token: process.env.UPSTASH_REDIS_REST_TOKEN,
-        });
-        isRedisReady = true;
-    } catch (e) {
-        console.error("Error creating Redis client:", e.message);
-    }
-}
+// 1. Global Memory Schema (for stats and weights)
+const GlobalMemorySchema = new mongoose.Schema({
+    _id: { type: String, default: MY_ID + ":global" },
+    weights: { type: Object, default: { "1": 0.5, "2": 0.5 } },
+    stats: { type: Object, default: { total: 0, learned: 0, matched: 0, hits: 0, fails: 0, vip: 0 } },
+}, { collection: 'global_memory' });
+const GlobalMemory = mongoose.model('GlobalMemory', GlobalMemorySchema);
 
-/* ================ Redis keys ================ */
-const MEM_KEY = MY_ID + ":memory";
-const HIS_KEY = MY_ID + ":history";
+// 2. Pattern Schema (for individual patterns)
+const PatternSchema = new mongoose.Schema({
+    _id: { type: String, required: true }, // pattern string as ID (e.g., 'txtx')
+    wins: { type: Number, default: 0 },
+    fails: { type: Number, default: 0 },
+    score: { type: Number, default: 1.0 },
+    is_vip: { type: Boolean, default: false },
+    vip_win_rate: { type: Number, default: 0.0 },
+}, { collection: 'patterns' });
+const Pattern = mongoose.model('Pattern', PatternSchema);
 
-/* ================ Core structures ================ */
+// 3. History Schema (mimics Redis Sorted Set)
+const HistorySchema = new mongoose.Schema({
+    result: { type: String, required: true }, // 't' or 'x'
+    timestamp: { type: Date, default: Date.now, index: true }, 
+}, { collection: 'history' });
+const History = mongoose.model('History', HistorySchema);
+
+/* ================ Core structures (In-Memory Cache) ================ */
 let memory = {
-    patterns: {}, // { 'pattern_string': { wins: N, fails: M, score: S } }
-    weights: { "1": 0.5, "2": 0.5 }, // Total weight
+    // Lưu trữ tạm thời tất cả patterns đã load từ DB để tính toán nhanh
+    patterns: {}, 
+    weights: { "1": 0.5, "2": 0.5 }, 
     stats: { total: 0, learned: 0, matched: 0, hits: 0, fails: 0, vip: 0 },
 };
 
-/* ================ Memory/Persistence ================ */
-let isPersistenceFailed = false; // Biến cờ để biết nếu lỗi Upstash
+/* ================ MongoDB Connection and Persistence ================ */
+let isPersistenceFailed = false;
+
+async function connectToMongo() {
+    if (!process.env.MONGO_URI) {
+        console.error("==========================================================================");
+        console.error("WARNING: Missing MONGO_URI env var. Running in In-Memory mode.");
+        console.error("==========================================================================");
+        return false;
+    }
+    
+    try {
+        await mongoose.connect(process.env.MONGO_URI);
+        isMongoReady = true;
+        console.log("MongoDB connected successfully.");
+        return true;
+    } catch (e) {
+        console.error("CRITICAL MONGO ERROR: Failed to connect to MongoDB:", e.message);
+        return false;
+    }
+}
 
 async function loadMemory() {
-    if (!isRedisReady || isPersistenceFailed) {
-        console.warn("Redis is not ready or has failed. Using in-memory store.");
+    if (!isMongoReady) {
+        console.warn("MongoDB is not ready. Using default in-memory store.");
         return;
     }
+
     try {
-        const memData = await redis.get(MEM_KEY);
-        if (memData) {
-            try {
-                memory = { ...memory, ...memData };
-                console.log("Loaded memory from redis - patterns:", memory.stats.learned);
-            } catch (e) {
-                console.error("Failed to parse memory data, using default.", e);
-            }
+        // 1. Load Global Memory (stats and weights)
+        let globalMem = await GlobalMemory.findById(MY_ID + ":global").lean();
+        if (globalMem) {
+            memory.weights = globalMem.weights;
+            memory.stats = globalMem.stats;
         } else {
-            console.log("Initialized memory in redis");
-            await saveMemory();
+            // Create initial global memory document
+            await new GlobalMemory({ _id: MY_ID + ":global" }).save();
         }
+
+        // 2. Load all Patterns into in-memory cache
+        const patternDocs = await Pattern.find().lean();
+        memory.patterns = {};
+        patternDocs.forEach(doc => {
+            memory.patterns[doc._id] = { ...doc, key: doc._id };
+        });
+        memory.stats.learned = patternDocs.length;
+
+        console.log(`Loaded memory from MongoDB: Patterns=${memory.stats.learned}, Cycles=${memory.stats.total}`);
+
     } catch (e) {
-        // Bắt lỗi hết giới hạn Upstash tại đây
-        console.error(`CRITICAL REDIS ERROR: ${e.message}. Switching to in-memory mode.`);
-        isPersistenceFailed = true; // Đánh dấu là không thể dùng Redis
+        console.error(`CRITICAL MONGO ERROR during load: ${e.message}. Switching to in-memory mode.`);
+        isPersistenceFailed = true;
     }
 }
 
 async function saveMemory() {
-    if (!isRedisReady || isPersistenceFailed) return;
+    if (!isMongoReady || isPersistenceFailed) return;
     try {
-        await redis.set(MEM_KEY, memory);
+        // 1. Save Global Memory (stats and weights)
+        await GlobalMemory.updateOne(
+            { _id: MY_ID + ":global" },
+            { $set: { weights: memory.weights, stats: memory.stats } },
+            { upsert: true }
+        );
+        
+        // 2. Save/Update all Patterns (chỉ lưu những pattern đang có trong RAM)
+        const updatePromises = Object.entries(memory.patterns).map(([key, p]) => {
+             // Sử dụng upsert để tạo mới nếu chưa có, hoặc update nếu đã có
+            return Pattern.updateOne(
+                { _id: key },
+                { $set: { ...p, _id: key } }, // Ghi đè toàn bộ dữ liệu pattern
+                { upsert: true }
+            );
+        });
+        await Promise.all(updatePromises);
+
     } catch (e) {
-        console.error("Failed to save memory to Redis (Hết giới hạn lệnh?). Disabling persistence.", e.message);
-        isPersistenceFailed = true; // Tắt persistence nếu gặp lỗi
+        console.error("Failed to save memory to MongoDB. Disabling persistence.", e.message);
+        isPersistenceFailed = true; 
     }
 }
 
-/* ================ History ================ */
+/* ================ History (MongoDB implementation) ================ */
 
 async function getHistory(limit) {
-    if (!isRedisReady || isPersistenceFailed) return [];
+    if (!isMongoReady || isPersistenceFailed) return [];
     try {
-        // zrevrange (from highest score to lowest)
-        return redis.zrevrange(HIS_KEY, 0, limit - 1);
+        // Lấy kết quả mới nhất (timestamp giảm dần)
+        const historyDocs = await History.find()
+            .sort({ timestamp: -1 }) 
+            .limit(limit)
+            .select('result -_id')
+            .lean();
+        
+        // Chuyển đổi từ [{ result: 't' }, { result: 'x' }] sang ['t', 'x']
+        return historyDocs.map(doc => doc.result);
     } catch (e) {
-        console.error("Failed to get history from Redis (Hết giới hạn lệnh?).", e.message);
+        console.error("Failed to get history from MongoDB.", e.message);
         return [];
     }
 }
 
 async function setHistory(data) {
-    if (!isRedisReady || isPersistenceFailed) return;
+    if (!isMongoReady || isPersistenceFailed) return;
     try {
-        // Use ZADD (Sorted Set) to store history, using timestamp as score to keep order
-        const timestamp = Date.now();
-        await redis.zadd(HIS_KEY, { score: timestamp, member: data });
-        // Trim the list to MAX_HIS to keep memory usage low
-        await redis.zremrangebyrank(HIS_KEY, 0, -(MAX_HIS + 1));
+        // 1. Add new entry
+        await History.create({ result: data });
+        
+        // 2. Trim old entries (mimic ZREMRANGEBYRANK)
+        // Tìm bản ghi MAX_HIS + 1 (cái đầu tiên cần xóa)
+        const oldestRecords = await History.find()
+            .sort({ timestamp: 1 }) // Sắp xếp theo thứ tự cũ nhất
+            .skip(MAX_HIS) // Bỏ qua MAX_HIS bản ghi mới nhất
+            .limit(1)
+            .lean();
+
+        if (oldestRecords.length > 0) {
+            const cutOffTime = oldestRecords[0].timestamp;
+            // Xóa tất cả các bản ghi cũ hơn bản ghi giới hạn
+            await History.deleteMany({ timestamp: { $lt: cutOffTime } });
+        }
+
     } catch (e) {
-        console.error("Failed to set history to Redis (Hết giới hạn lệnh?).", e.message);
+        console.error("Failed to set history to MongoDB.", e.message);
     }
 }
 
-/* ================ Pattern Learning (APR - Adaptive Pattern Recognition) ================ */
-
-// (Các hàm getPattern, normalizeWeights, updatePatternScore, learn, classifyMarketState, predictNext giữ nguyên)
+/* ================ Pattern Learning (APR) ================ */
 
 function getPattern(historyArr, length) {
     if (historyArr.length < length) return null;
@@ -184,6 +249,8 @@ function learn(history) {
 
     memory.stats.total++;
 }
+
+/* ================ Engine Logic (Giữ nguyên) ================ */
 
 function classifyMarketState(history) {
     if (history.length === 0) return 0;
@@ -295,7 +362,7 @@ async function pollApiAndLearn() {
         const latestResult = results[0];
         await setHistory(latestResult);
 
-        // 3. Save memory (patterns)
+        // 3. Save memory (patterns và stats)
         await saveMemory();
 
         console.log(`[${new Date().toLocaleTimeString()}] Polled API: Latest=${latestResult}, Learned=${memory.stats.learned}`);
@@ -307,7 +374,7 @@ async function pollApiAndLearn() {
 
 // ====================== VIP Pattern injection ======================
 const VIP_PATTERNS_TEXT = `
-1. XTXXTXTTXXTTXX - X
+  1. XTXXTXTTXXTTXX - X
 2. XXTXTTXXXTTXXT - X
 3. TXTXTTTXXTXXXT - T
 4. XXTXXTTXXXXTXT - X
@@ -10336,16 +10403,26 @@ function loadVipFromTextAndInject(text) {
 }
 
 
-/* ================ API Endpoints ================ */
+/* ================ API Endpoints (Giữ nguyên) ================ */
 
-// Health Check
 app.get("/", (req, res) => {
     res.json({ status: "ok", service: MY_ID, uptime: process.uptime() });
 });
 
-// Main prediction endpoint
+app.get("/api/history", async (req, res) => {
+    const limit = Number(req.query.limit) || MAX_HIS;
+    const rawHistory = await getHistory(limit); 
+    
+    res.json({
+        history_limit: limit,
+        history_count: rawHistory.length,
+        is_persistence_active: isMongoReady && !isPersistenceFailed,
+        history: rawHistory.slice(0, 1000), 
+        marketState: classifyMarketState(rawHistory) 
+    });
+});
+
 app.get("/api/predict", async (req, res) => {
-    // Sẽ trả về lịch sử trống nếu Redis bị lỗi
     const history = await getHistory(15); 
     const prediction = predictNext(history);
     const topPatterns = Object.entries(memory.patterns)
@@ -10364,14 +10441,12 @@ app.get("/api/predict", async (req, res) => {
             fails: memory.stats.fails,
             vipMatches: prediction.vipMatches,
             marketState: classifyMarketState(await getHistory(200)),
-            // Thêm trạng thái persistence để bạn dễ kiểm tra
-            is_persistence_active: isRedisReady && !isPersistenceFailed
+            is_persistence_active: isMongoReady && !isPersistenceFailed
         },
         topPatterns: topPatterns.slice(0, 60), 
     });
 });
 
-/* Admin: view memory */
 app.get("/admin/memory", async (req, res) => {
     const arr = Object.entries(memory.patterns).map(([key, mem]) => ({ key, ...mem }));
     res.json({
@@ -10381,7 +10456,6 @@ app.get("/admin/memory", async (req, res) => {
     });
 });
 
-/* Admin: reload VIP content embedded */
 app.get("/admin/reload-vip", async (req, res) => {
     try {
         const n = loadVipFromTextAndInject(VIP_PATTERNS_TEXT);
@@ -10390,11 +10464,10 @@ app.get("/admin/reload-vip", async (req, res) => {
     } catch (e) { res.status(500).json({ error: e.message || e }); }
 });
 
-/* Admin: wipe history (danger) */
 app.post("/admin/wipe-history", async (req, res) => {
-    if (!isRedisReady || isPersistenceFailed) return res.status(400).json({ error: "Redis is not active or connection failed." });
+    if (!isMongoReady || isPersistenceFailed) return res.status(400).json({ error: "MongoDB connection failed." });
     try {
-        await redis.del(HIS_KEY);
+        await History.deleteMany({});
         res.json({ ok: true });
     } catch (e) { res.status(500).json({ error: e.message || e }); }
 });
@@ -10404,7 +10477,7 @@ async function persistAll() { await saveMemory(); }
 process.on("SIGINT", async () => { await persistAll(); process.exit(0); });
 process.on("SIGTERM", async () => { await persistAll(); process.exit(0); });
 
-/* ================ API Poller (REVISED) ================ */
+/* ================ API Poller ================ */
 
 async function pollApiLoop() {
     try {
@@ -10418,18 +10491,17 @@ async function pollApiLoop() {
 
 /* ================ INIT ================ */
 (async () => {
-    // Sửa lỗi: Cố gắng load memory, nếu lỗi thì chuyển sang in-memory
-    await loadMemory(); 
-    
-    // Nếu loadMemory không crash (do cơ chế try/catch mới) và không gặp lỗi persistence, 
-    // thì tiếp tục init như bình thường
+    const connected = await connectToMongo();
+    if (connected) {
+        await loadMemory(); 
+    }
     
     loadVipFromTextAndInject(VIP_PATTERNS_TEXT);
     
+    // Nếu kết nối Mongo bị lỗi, getHistory sẽ trả về rỗng, vẫn cần fetch
     const existing = await getHistory(1);
     if (!existing || existing.length === 0) {
         console.log("History is empty, fetching initial data...");
-        // Cố gắng fetch và save (sẽ tự động disable save nếu redis fail)
         await pollApiAndLearn(); 
     }
 
@@ -10437,11 +10509,11 @@ async function pollApiLoop() {
 
     app.listen(PORT, () => {
         console.log(`Server running on port ${PORT}`);
-        if (isPersistenceFailed) {
+        if (!isMongoReady || isPersistenceFailed) {
             console.warn("**************************************************");
-            console.warn("REDIS PERSISTENCE FAILED! Running in In-Memory mode.");
+            console.warn("PERSISTENCE FAILED! Running in In-Memory mode.");
             console.warn("Patterns/History will be lost on next restart/deploy.");
-            console.warn("Check Upstash (hết giới hạn) hoặc nâng cấp gói.");
+            console.warn("Check MONGO_URI hoặc kết nối MongoDB.");
             console.warn("**************************************************");
         }
     });
