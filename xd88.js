@@ -6,8 +6,6 @@ const { Redis } = require("@upstash/redis");
 const app = express();
 app.use(cors());
 app.use(express.json());
-
-/* ===================== CONFIG ===================== */
 const PORT = process.env.PORT || 3000;
 const MY_ID = process.env.MY_ID || "tiendat";
 const API_URL = process.env.API_URL || "https://taixiu.system32-cloudfare-356783752985678522.monster/api/luckydice/GetSoiCau";
@@ -19,29 +17,271 @@ const APR_BOOST_STEP = 0.06; // how much to boost pattern.score on consecutive w
 const APR_PENALTY_STEP = 0.05; // penalty on fails
 const APR_MAX_SCORE = 1.5; // cap multiplier
 const APR_MIN_SCORE = 0.1;
-/* ================================================== */
 
-/* ================ Upstash Redis client ============== */
 if (!process.env.UPSTASH_REDIS_REST_URL || !process.env.UPSTASH_REDIS_REST_TOKEN) {
-  console.error("Missing UPSTASH_REDIS_REST_URL or UPSTASH_REDIS_REST_TOKEN env vars");
+  console.error("==========================================================================");
+  console.error("CRITICAL ERROR: Missing UPSTASH_REDIS_REST_URL or UPSTASH_REDIS_REST_TOKEN env vars.");
+  console.error("Application cannot run without Redis connection details. Please configure on Render.");
+  console.error("==========================================================================");
   process.exit(1);
 }
 const redis = new Redis({
   url: process.env.UPSTASH_REDIS_REST_URL,
-  token: process.env.UPSTASH_REDIS_REST_TOKEN
+  token: process.env.UPSTASH_REDIS_REST_TOKEN,
 });
-const HIS_KEY = "xeng17:history";
-const MEM_KEY = "xeng17:memory";
 
-/* ================ VIP PATTERNS EMBED ================ */
-/*
- Paste your full VIP file content (the large numbered list) between the backticks below.
- Keep the exact format "NN. PATTERN - R" or "PATTERN - R" lines. Example:
-   1. XTXXTXTT - X
-   2. TXXTTT - T
-*/
+/* ================ Redis keys ================ */
+const MEM_KEY = MY_ID + ":memory";
+const HIS_KEY = MY_ID + ":history";
+
+/* ================ Core structures ================ */
+let memory = {
+  patterns: {}, // { 'pattern_string': { wins: N, fails: M, score: S } }
+  weights: { "1": 0.5, "2": 0.5 }, // Total weight
+  stats: { total: 0, learned: 0, matched: 0, hits: 0, fails: 0, vip: 0 },
+};
+
+/* ================ Memory/Persistence ================ */
+
+async function loadMemory() {
+  const memData = await redis.get(MEM_KEY);
+  if (memData) {
+    try {
+      memory = { ...memory, ...memData };
+      console.log("Loaded memory from redis - patterns:", memory.stats.learned);
+    } catch (e) {
+      console.error("Failed to parse memory data, using default.", e);
+    }
+  } else {
+    console.log("Initialized memory in redis");
+    await saveMemory();
+  }
+}
+
+async function saveMemory() {
+  await redis.set(MEM_KEY, memory);
+}
+
+/* ================ History ================ */
+
+async function getHistory(limit) {
+  // zrevrange (from highest score to lowest)
+  return redis.zrevrange(HIS_KEY, 0, limit - 1);
+}
+
+async function setHistory(data) {
+  // Use ZADD (Sorted Set) to store history, using timestamp as score to keep order
+  const timestamp = Date.now();
+  await redis.zadd(HIS_KEY, { score: timestamp, member: data });
+  // Trim the list to MAX_HIS to keep memory usage low
+  await redis.zremrangebyrank(HIS_KEY, 0, -(MAX_HIS + 1));
+}
+
+/* ================ Pattern Learning (APR - Adaptive Pattern Recognition) ================ */
+
+function getPattern(historyArr, length) {
+  if (historyArr.length < length) return null;
+  // Patterns are reversed, so the most recent result is at position 0
+  return historyArr.slice(0, length).join("");
+}
+
+function normalizeWeights(weights) {
+  const total = Object.values(weights).reduce((a, b) => a + b, 0);
+  if (total === 0) return weights;
+  const normalized = {};
+  for (const key in weights) {
+    normalized[key] = weights[key] / total;
+  }
+  return normalized;
+}
+
+// 0 - fail, 1 - win
+function updatePatternScore(patternKey, result) {
+  if (!memory.patterns[patternKey]) return;
+
+  let p = memory.patterns[patternKey];
+  let currentScore = p.score || 1.0;
+
+  if (result === 1) {
+    // Win: boost score
+    p.wins++;
+    currentScore = Math.min(APR_MAX_SCORE, currentScore + APR_BOOST_STEP);
+    memory.stats.hits++;
+  } else {
+    // Fail: penalize score
+    p.fails++;
+    currentScore = Math.max(APR_MIN_SCORE, currentScore - APR_PENALTY_STEP);
+    memory.stats.fails++;
+  }
+  p.score = currentScore;
+}
+
+function learn(history) {
+  if (history.length < 2) return;
+
+  // The result of the second-most recent entry determines the outcome
+  // The pattern leading to the second-most recent result is the third-most recent onwards
+  const outcome = history[1]; // Result of the history[1] entry
+  const precedingPattern = history.slice(2, history.length);
+
+  // We learn based on the outcome of the **previous** turn
+  // Patterns are extracted from the list starting from the 3rd element
+  // e.g. [current, prev_result, prev_pattern_3, prev_pattern_2, ...]
+  for (let length = 1; length <= 15; length++) {
+    const patternStr = getPattern(precedingPattern, length);
+    if (!patternStr) continue;
+
+    const key = patternStr;
+    const nextOutcome = outcome; // The result *following* this pattern
+
+    if (!memory.patterns[key]) {
+      memory.patterns[key] = { wins: 0, fails: 0, score: 1.0, is_vip: false, vip_win_rate: 0.0 };
+      memory.stats.learned++;
+    }
+
+    if (nextOutcome === 't') { // TÀI
+      updatePatternScore(key, nextOutcome === 't' ? 1 : 0);
+    } else if (nextOutcome === 'x') { // XỈU
+      updatePatternScore(key, nextOutcome === 'x' ? 1 : 0);
+    }
+  }
+
+  memory.stats.total++;
+}
+
+
+/* ================ Engine Logic ================ */
+
+/**
+ * Classifies market state for weight adjustment.
+ * 1: Tài nhiều hơn Xỉu (T > X)
+ * 2: Xỉu nhiều hơn Tài (X > T)
+ * 0: Cân bằng (T = X)
+ * @param {string[]} history - Array of 't' and 'x' results.
+ */
+function classifyMarketState(history) {
+  if (history.length === 0) return 0;
+  const countT = history.filter(r => r === 't').length;
+  const countX = history.filter(r => r === 'x').length;
+
+  if (countT > countX) return 1; // Market favors Tài
+  if (countX > countT) return 2; // Market favors Xỉu
+  return 0; // Balanced
+}
+
+/**
+ * Predicts the next result ('t' or 'x') based on current memory.
+ * @param {string[]} currentHistory - Most recent results, e.g., ['t', 'x', 'x']
+ * @returns {object} { prediction: 't'|'x', score: number }
+ */
+function predictNext(currentHistory) {
+  const currentWeights = { t: 0, x: 0 };
+  const matchedPatterns = [];
+
+  // --- 1. Pattern Matching Engine (70% - BASE_ENGINE_PORTION) ---
+  for (let length = 1; length <= 15; length++) {
+    const patternStr = getPattern(currentHistory, length);
+    if (!patternStr) continue;
+
+    const pattern = memory.patterns[patternStr];
+    if (pattern) {
+      memory.stats.matched++;
+      matchedPatterns.push({ key: patternStr, ...pattern });
+
+      // Apply the pattern's score to the next outcome
+      // Pushing 't' weight
+      const t_key = patternStr + 't';
+      const x_key = patternStr + 'x';
+      const t_pattern = memory.patterns[t_key];
+      const x_pattern = memory.patterns[x_key];
+
+      if (t_pattern) {
+        currentWeights.t += (t_pattern.score || 1.0);
+      }
+      if (x_pattern) {
+        currentWeights.x += (x_pattern.score || 1.0);
+      }
+    }
+  }
+
+  // Fallback if no patterns matched (highly unlikely)
+  if (currentWeights.t === 0 && currentWeights.x === 0) {
+    currentWeights.t = 1;
+    currentWeights.x = 1;
+  }
+
+  // Normalize pattern weights
+  const patternTotal = currentWeights.t + currentWeights.x;
+  const patternWeightT = currentWeights.t / patternTotal;
+  const patternWeightX = currentWeights.x / patternTotal;
+
+  // --- 2. VIP Pattern Engine (30% - VIP_INFLUENCE) ---
+  let vipWeightT = 0;
+  let vipWeightX = 0;
+  let vipMatches = 0;
+
+  for (const key in memory.patterns) {
+    const p = memory.patterns[key];
+    if (p.is_vip && key.startsWith(currentHistory.join(""))) {
+      vipMatches++;
+      if (p.vip_win_rate > 0.5) {
+        vipWeightT += p.vip_win_rate;
+      } else {
+        vipWeightX += (1 - p.vip_win_rate);
+      }
+    }
+  }
+
+  if (vipMatches > 0) {
+    const vipTotal = vipWeightT + vipWeightX;
+    vipWeightT = vipWeightT / vipTotal;
+    vipWeightX = vipWeightX / vipTotal;
+    memory.stats.vip = vipMatches;
+  } else {
+    vipWeightT = 0.5; 
+    vipWeightX = 0.5; 
+  }
+
+  // --- 3. Final Weighted Prediction ---
+  const finalWeightT = (patternWeightT * BASE_ENGINE_PORTION) + (vipWeightT * VIP_INFLUENCE);
+  const finalWeightX = (patternWeightX * BASE_ENGINE_PORTION) + (vipWeightX * VIP_INFLUENCE);
+
+  const finalTotal = finalWeightT + finalWeightX;
+  const finalNormalizedT = finalWeightT / finalTotal;
+  const finalNormalizedX = finalWeightX / finalTotal;
+
+  const finalPrediction = finalNormalizedT > finalNormalizedX ? 't' : 'x';
+
+  return {
+    prediction: finalPrediction,
+    score: Math.max(finalNormalizedT, finalNormalizedX),
+    weights: { t: finalNormalizedT, x: finalNormalizedX },
+    matchedPatterns: matchedPatterns,
+    vipMatches: vipMatches
+  };
+}
+
+async function pollApiAndLearn() {
+  try {
+    const response = await axios.get(API_URL);
+    const data = response.data.data;
+    if (!data || data.length === 0) return;
+    const results = data.map(item => item.betType === 1 ? 't' : 'x');
+    learn(results);
+    const latestResult = results[0];
+    await setHistory(latestResult);
+
+    // 3. Save memory (patterns)
+    await saveMemory();
+
+    console.log(`[${new Date().toLocaleTimeString()}] Polled API: Latest=${latestResult}, Learned=${memory.stats.learned}`);
+
+  } catch (error) {
+    console.error("Error during API polling:", error.message || error);
+  }
+}
 const VIP_PATTERNS_TEXT = `
- 1. XTXXTXTTXXTTXX - X
+1. XTXXTXTTXXTTXX - X
 2. XXTXTTXXXTTXXT - X
 3. TXTXTTTXXTXXXT - T
 4. XXTXXTTXXXXTXT - X
@@ -10041,630 +10281,79 @@ const VIP_PATTERNS_TEXT = `
 9998. TTXTXTXXXTXTXX - X
 9999. TXTTTTTTXXXXXX - T
 10000. TXXTTTXXTTTXTT - T
+`;
 
-`; 
-
-/* ================ MEMORY DEFAULT =================== */
-const defaultMemory = {
-  patterns: {}, // pattern => { count, success, fail, score, lastSeen, vip, expected, aprStreak }
-  weights: {
-    oldSimple: 0.7,
-    patternLookup: 1.6,
-    fuzzyMatch: 1.0,
-    trend: 1.0,
-    momentum: 1.0,
-    powerRank: 1.2,
-    akira: 1.2,
-    vip: 1.0
-  },
-  stats: { totalPred: 0, totalCorrect: 0 },
-  settings: {
-    patternMinLen: 3,
-    patternMaxLen: 8,
-    minPatternOccurrences: 2,
-    lockoutAfterFails: 4,
-    memoryKeepPatterns: 4000,
-    updatePatternEvery: 10
-  },
-  marketProfile: {
-    // weights per market state (T / X multipliers on engines) - will be adjusted automatically by learning
-    states: {
-      "ultra_trending": { factor: 1.15 },
-      "semi_trending": { factor: 1.08 },
-      "low_volatile": { factor: 1.02 },
-      "high_volatile": { factor: 0.9 },
-      "balanced": { factor: 0.98 },
-      "reverse": { factor: 0.95 }
-    }
-  }
-};
-let MEMORY = { ...defaultMemory };
-
-/* ================== REDIS HELPERS =================== */
-async function loadMemory() {
-  try {
-    const raw = await redis.get(MEM_KEY);
-    if (raw) {
-      MEMORY = JSON.parse(raw);
-      console.log("Loaded memory from redis - patterns:", Object.keys(MEMORY.patterns || {}).length);
-    } else {
-      MEMORY = { ...defaultMemory };
-      await saveMemory();
-      console.log("Initialized memory in redis");
-    }
-  } catch (e) {
-    console.error("loadMemory err", e.message || e);
-    MEMORY = { ...defaultMemory };
-  }
-}
-async function saveMemory() {
-  try {
-    await redis.set(MEM_KEY, JSON.stringify(MEMORY));
-  } catch (e) { console.error("saveMemory err", e.message || e); }
-}
-async function pushHistory(item) {
-  try {
-    await redis.lpush(HIS_KEY, JSON.stringify(item));
-    await redis.ltrim(HIS_KEY, 0, MAX_HIS - 1);
-  } catch (e) { console.error("pushHistory err", e.message || e); }
-}
-async function getHistory(limit = MAX_HIS) {
-  try {
-    const arr = await redis.lrange(HIS_KEY, 0, limit - 1);
-    return arr.map(s => {
-      try { return JSON.parse(s); } catch (e) { return null; }
-    }).filter(Boolean);
-  } catch (e) { console.error("getHistory err", e.message || e); return []; }
-}
-async function getLatestPhienLocal() {
-  try {
-    const raw = await redis.lindex(HIS_KEY, 0);
-    if (!raw) return 0;
-    const obj = JSON.parse(raw);
-    return Number(obj.phien || 0);
-  } catch (e) { return 0; }
-}
-
-/* =================== FETCH REMOTE =================== */
-async function fetchRemote(limit = 50) {
-  try {
-    const r = await axios.get(API_URL, { timeout: 7000 });
-    const arr = Array.isArray(r.data) ? r.data.slice(0, limit) : [];
-    return arr.map(e => ({
-      phien: Number(e.SessionId),
-      x1: Number(e.FirstDice),
-      x2: Number(e.SecondDice),
-      x3: Number(e.ThirdDice),
-      tong: Number(e.DiceSum),
-      kq: e.BetSide === 0 ? "T" : "X",
-      ts: Date.now()
-    }));
-  } catch (e) {
-    // graceful empty
-    return [];
-  }
-}
-
-/* =================== SEQUENCE HELPERS =================== */
-function seqNewestFirst(his, len = 500) { return his.slice(0, len).map(i => i.kq).join(""); }
-function seqOldestFirst(his, len = 500) { return his.slice(0, len).map(i => i.kq).reverse().join(""); }
-
-/* =================== PATTERN EXTRACT =================== */
-function extractPatterns(his, minL, maxL) {
-  const seq = seqOldestFirst(his, 1500);
-  const map = {};
-  for (let L = minL; L <= maxL; L++) {
-    for (let i = 0; i + L <= seq.length; i++) {
-      const p = seq.slice(i, i + L);
-      if (!p) continue;
-      map[p] = (map[p] || 0) + 1;
-    }
-  }
-  return map;
-}
-function updatePatternDB(his) {
-  try {
-    const s = MEMORY.settings;
-    const counts = extractPatterns(his, s.patternMinLen, s.patternMaxLen);
-    Object.keys(counts).forEach(p => {
-      const c = counts[p];
-      if (c >= s.minPatternOccurrences) {
-        if (!MEMORY.patterns[p]) MEMORY.patterns[p] = { count: c, success: 0, fail: 0, score: 0.5, lastSeen: Date.now(), lockedUntil: 0, vip: false, aprStreak: 0 };
-        else { MEMORY.patterns[p].count = Math.max(MEMORY.patterns[p].count || 0, c); MEMORY.patterns[p].lastSeen = Date.now(); }
-      }
-    });
-    // prune by combined metric
-    const keys = Object.keys(MEMORY.patterns);
-    if (keys.length > s.memoryKeepPatterns) {
-      const sorted = keys.sort((a, b) => ((MEMORY.patterns[b].count || 0) * ((MEMORY.patterns[b].score || 0) + 1)) - ((MEMORY.patterns[a].count || 0) * ((MEMORY.patterns[a].score || 0) + 1)));
-      const keep = new Set(sorted.slice(0, s.memoryKeepPatterns));
-      Object.keys(MEMORY.patterns).forEach(k => { if (!keep.has(k) && !MEMORY.patterns[k].vip) delete MEMORY.patterns[k]; });
-    }
-  } catch (e) { console.error("updatePatternDB err", e.message || e); }
-}
-
-/* ================== VIP PARSER (TEXT) ================== */
-function parseVipFromText(text) {
-  const lines = text.split(/\r?\n/);
-  const out = {};
-  for (let l of lines) {
-    l = l.trim();
-    if (!l) continue;
-    l = l.replace(/^\d+\.\s*/, ""); // remove numbering
-    const parts = l.split(/\s*-\s*/);
-    if (parts.length < 2) continue;
-    const pattern = parts[0].replace(/\s+/g, "").toUpperCase();
-    const res = parts[1].trim().toUpperCase().slice(0, 1);
-    if (!/^[TX]+$/.test(pattern)) continue;
-    if (res !== "T" && res !== "X") continue;
-    out[pattern] = res;
-  }
-  return out;
-}
+/**
+ * Loads VIP patterns from a text block and injects them into the memory.
+ * They are marked with is_vip: true.
+ * @param {string} text 
+ * @returns {number}
+ */
 function loadVipFromTextAndInject(text) {
-  try {
-    const parsed = parseVipFromText(text);
-    let added = 0;
-    for (let p in parsed) {
-      const expected = parsed[p];
-      const rec = MEMORY.patterns[p] || {};
-      rec.count = Math.max(rec.count || 0, 50);
-      rec.score = Math.max(rec.score || 0.9, 0.9);
-      rec.success = rec.success || 0;
-      rec.fail = rec.fail || 0;
-      rec.lastSeen = Date.now();
-      rec.lockedUntil = 0;
-      rec.vip = true;
-      rec.expected = expected;
-      rec.aprStreak = rec.aprStreak || 0;
-      MEMORY.patterns[p] = rec;
-      added++;
-    }
-    if (added > 0) saveMemory().catch(() => { });
-    console.log("VIP load injected patterns:", added);
-    return added;
-  } catch (e) { console.error("loadVipFromText err", e.message || e); return 0; }
-}
+  let count = 0;
+  const lines = text.trim().split(';');
 
-/* ============== PREDICTION MODULES =============== */
-function oldSimplePredict(his) {
-  if (!his || his.length < 8) return { pred: "N/A", reason: "bad data" };
-  const seq = his.slice(0, 20).map(i => i.kq).join("");
-  const head = seq[0];
-  const m = seq.match(new RegExp(`^${head}+`));
-  const streak = m ? m[0].length : 0;
-  if (streak >= 4) return { pred: head === "T" ? "X" : "T", conf: 0.6, reason: `streak ${head} x${streak}` };
-  const cT = (seq.match(/T/g) || []).length, cX = (seq.match(/X/g) || []).length;
-  if (Math.abs(cT - cX) >= 6) return { pred: cT > cX ? "T" : "X", conf: Math.min(0.85, Math.abs(cT - cX) / seq.length), reason: "ratio" };
-  return { pred: seq[0] === "T" ? "X" : "T", conf: 0.5, reason: "fallback" };
-}
+  for (const line of lines) {
+    const trimmedLine = line.trim();
+    if (trimmedLine.length === 0) continue;
 
-function patternLookupPredict(his) {
-  const tailLen = MEMORY.settings.patternMaxLen;
-  const recent = seqOldestFirst(his, tailLen + 2);
-  const lastPart = recent.slice(-tailLen);
-  const candidates = {};
-  for (let p in MEMORY.patterns) {
-    if (lastPart.endsWith(p)) candidates[p] = MEMORY.patterns[p];
-  }
-  if (Object.keys(candidates).length === 0) return null;
-  const hist = seqOldestFirst(his, 1000);
-  const tally = { T: 0, X: 0 };
-  Object.keys(candidates).forEach(p => {
-    let idx = 0;
-    while ((idx = hist.indexOf(p, idx)) !== -1) {
-      const nextIdx = idx + p.length;
-      if (nextIdx < hist.length) {
-        const nxt = hist[nextIdx];
-        if (nxt === 'T' || nxt === 'X') tally[nxt] += (MEMORY.patterns[p].count || 1);
+    const [pattern, rateStr] = trimmedLine.split(':');
+    const rate = parseFloat(rateStr);
+
+    if (pattern && rate && !isNaN(rate)) {
+      const key = pattern.toLowerCase();
+      if (!memory.patterns[key]) {
+        memory.patterns[key] = { wins: 0, fails: 0, score: 1.0, is_vip: true, vip_win_rate: rate };
+        memory.stats.learned++;
+      } else {
+        // Update existing pattern
+        memory.patterns[key].is_vip = true;
+        memory.patterns[key].vip_win_rate = rate;
       }
-      idx++;
-    }
-  });
-  const total = tally.T + tally.X;
-  if (total === 0) return null;
-  return { pred: tally.T >= tally.X ? "T" : "X", conf: Math.max(tally.T, tally.X) / total, reason: `patternLookup T:${tally.T} X:${tally.X}` };
-}
-
-function fuzzyMatchPredict(his) {
-  const shortPat = seqOldestFirst(his, 15).slice(-15);
-  const longPat = seqOldestFirst(his, 400);
-  if (!shortPat || shortPat.length < 6 || !longPat) return null;
-  let best = { pct: 0, match: "", idx: -1 };
-  const L = shortPat.length;
-  for (let i = 0; i + L <= longPat.length; i++) {
-    const slice = longPat.slice(i, i + L);
-    let same = 0;
-    for (let j = 0; j < L; j++) if (slice[j] === shortPat[j]) same++;
-    const pct = (same / L) * 100;
-    if (pct > best.pct) best = { pct, match: slice, idx: i };
-  }
-  if (best.pct >= 78) {
-    const nextIdx = best.idx + L;
-    if (nextIdx < longPat.length) return { pred: longPat[nextIdx], conf: best.pct / 100, reason: `fuzzy ${best.pct.toFixed(1)}%` };
-  }
-  return null;
-}
-
-function trendPredict(his) {
-  const window = Math.min(his.length, 80);
-  if (window < 6) return null;
-  const seq = seqOldestFirst(his, window);
-  const t = (seq.match(/T/g) || []).length;
-  const x = (seq.match(/X/g) || []).length;
-  const total = t + x;
-  if (total === 0) return null;
-  if (t / total > 0.62) return { pred: "T", conf: t / total, reason: `trend T ${t}/${total}` };
-  if (x / total > 0.62) return { pred: "X", conf: x / total, reason: `trend X ${x}/${total}` };
-  return null;
-}
-
-function momentumPredict(his) {
-  const seq = seqNewestFirst(his, 30);
-  if (!seq || seq.length < 4) return null;
-  const head = seq[0]; let streak = 1;
-  for (let i = 1; i < seq.length; i++) { if (seq[i] === head) streak++; else break; }
-  if (streak >= 2 && streak <= 6) return { pred: head, conf: 0.48 + (streak * 0.06), reason: `momentum ${head} x${streak}` };
-  return null;
-}
-
-function powerRankPredict(his) {
-  const seq = seqOldestFirst(his, 150);
-  if (!seq || seq.length < 8) return null;
-  let scoreT = 0, scoreX = 0;
-  if (seq.match(/T{5,}/)) scoreX += 8;
-  if (seq.match(/X{5,}/)) scoreT += 8;
-  const tail6 = seq.slice(-6);
-  if (/^(TX|XT){3}$/.test(tail6)) {
-    const next = tail6[0] === 'T' ? 'X' : 'T';
-    if (next === 'T') scoreT += 6; else scoreX += 6;
-  }
-  const tcount = (seq.match(/T/g) || []).length, xcount = (seq.match(/X/g) || []).length;
-  if (tcount - xcount >= Math.ceil(seq.length * 0.15)) scoreT += 4;
-  if (xcount - tcount >= Math.ceil(seq.length * 0.15)) scoreX += 4;
-  // pattern DB bias
-  let dbT = 0, dbX = 0;
-  for (let p in MEMORY.patterns) {
-    const rec = MEMORY.patterns[p];
-    if (!rec.count) continue;
-    const last = p[p.length - 1];
-    if (last === 'T') dbT += rec.count;
-    if (last === 'X') dbX += rec.count;
-  }
-  if (dbT + dbX > 0) { if (dbT > dbX) scoreT += 2; else scoreX += 2; }
-  const pred = scoreT >= scoreX ? "T" : "X";
-  const conf = Math.min(0.98, Math.max(0.05, Math.abs(scoreT - scoreX) / (Math.abs(scoreT) + Math.abs(scoreX) + 1)));
-  return { pred, conf, reason: `powerRank T:${scoreT} X:${scoreX}` };
-}
-
-/* ================= AKIRA (kept lean) ================= */
-function detectPatterns(his) {
-  const seqNew = seqNewestFirst(his, 40);
-  const out = { is121: false, is212: false, is22: false, is11: false, longBett: false, bHead: '', headLen: 0 };
-  if (!seqNew || seqNew.length < 4) return out;
-  const head = seqNew[0];
-  let headLen = 1;
-  for (let i = 1; i < seqNew.length; i++) { if (seqNew[i] === head) headLen++; else break; }
-  out.bHead = head; out.headLen = headLen;
-  if (headLen >= 4) out.longBett = true;
-  const s6 = seqNew.slice(0, 6);
-  if (/^(TX|XT){3}$/.test(s6)) out.is11 = true;
-  const s8 = seqNew.slice(0, 8);
-  if (/^(TTXX|XXTT){2,}$/.test(s8)) out.is22 = true;
-  const s4 = seqNew.slice(0, 4);
-  if (s4[0] === s4[3] && s4[1] === s4[2] && s4[0] !== s4[1]) out.is121 = true;
-  const s5 = seqNew.slice(0, 5);
-  if (s5.length === 5 && s5[0] === s5[1] && s5[3] === s5[4] && s5[0] === s5[4] && s5[2] !== s5[0]) out.is212 = true;
-  return out;
-}
-function akiraPredict(his) {
-  const mod = [];
-  const pat = detectPatterns(his);
-  if (pat.longBett) {
-    const head = pat.bHead;
-    if (pat.headLen >= 6) mod.push({ name: "akira_long_break", pred: head === "T" ? "X" : "T", conf: 0.6, weight: 1.0, reason: "batbet long" });
-    else mod.push({ name: "akira_bet", pred: head === "T" ? head : head, conf: 0.52, weight: 0.9, reason: "akira be/bat" });
-  }
-  if (pat.is11) mod.push({ name: "akira_is11", pred: seqNewestFirst(his, 6)[0] === 'T' ? 'X' : 'T', conf: 0.45, weight: 0.7, reason: "1-1" });
-  if (!mod.length) return { prediction: "N/A", confidence: 0, reasons: ["akira none"] };
-  let score = { T: 0, X: 0 }; const reasons = [];
-  mod.forEach(m => {
-    const w = (m.weight || 1) * (MEMORY.weights.akira || 1);
-    const conf = Math.min(0.99, Math.max(0.01, m.conf || 0.5));
-    if (m.pred === 'T') score.T += w * conf; else score.X += w * conf;
-    reasons.push(`${m.name}:${m.reason}`);
-  });
-  const final = score.T >= score.X ? 'T' : 'X';
-  const conf = Math.max(0.01, Math.min(0.999, Math.max(score.T, score.X) / (score.T + score.X || 1)));
-  return { prediction: final, confidence: conf, reasons };
-}
-
-/* =================== VIP PREDICT =================== */
-function vipPredict(his) {
-  try {
-    const tailLen = MEMORY.settings.patternMaxLen;
-    const recent = seqOldestFirst(his, tailLen + 2);
-    const lastPart = recent.slice(-tailLen);
-    // direct suffix match prioritized
-    for (let L = tailLen; L >= MEMORY.settings.patternMinLen; L--) {
-      const suf = lastPart.slice(-L);
-      const rec = MEMORY.patterns[suf];
-      if (rec && rec.vip && rec.expected) {
-        const conf = Math.min(0.99, (rec.score || 0.9) * Math.min(1, (rec.count || 50) / 50) * (1 + (rec.aprStreak || 0) * 0.02));
-        return { pred: rec.expected, conf, reason: `vip suffix ${suf}` };
-      }
-    }
-    // fuzzy VIP matching
-    const cur = seqOldestFirst(his, 40).slice(-15);
-    let bestPct = 0, bestPred = null, bestPat = null;
-    for (let p in MEMORY.patterns) {
-      const rec = MEMORY.patterns[p];
-      if (!rec.vip) continue;
-      const L = Math.min(p.length, cur.length);
-      let same = 0;
-      for (let i = 0; i < L; i++) if (p[p.length - L + i] === cur[cur.length - L + i]) same++;
-      const pct = same / L;
-      if (pct > bestPct) { bestPct = pct; bestPred = rec.expected; bestPat = p; }
-    }
-    if (bestPct >= 0.72 && bestPred) return { pred: bestPred, conf: 0.48 + bestPct * 0.4, reason: `vip fuzzy ${Math.round(bestPct * 100)}% pat:${bestPat}` };
-    return null;
-  } catch (e) { console.error("vipPredict err", e); return null; }
-}
-
-/* ============== RECURSIVE PATTERN PROJECTION (RPP) ============== */
-/*
-  Idea: take recent suffix S, find similar contexts historically, collect what followed them,
-  weight by similarity and recency, return aggregate projection.
-*/
-function recursivePatternProjection(his, suffixLen = 6, lookBack = 1000) {
-  try {
-    const hist = seqOldestFirst(his, lookBack + suffixLen);
-    const cur = hist.slice(-suffixLen);
-    if (!cur || cur.length < 3) return null;
-    const tally = { T: 0, X: 0 };
-    // search historical windows of same length
-    for (let i = 0; i + suffixLen < hist.length; i++) {
-      const slice = hist.slice(i, i + suffixLen);
-      // similarity (character match)
-      let same = 0;
-      for (let j = 0; j < suffixLen; j++) if (slice[j] === cur[j]) same++;
-      const sim = same / suffixLen;
-      if (sim >= 0.6) {
-        const next = hist[i + suffixLen];
-        if (next === 'T' || next === 'X') {
-          // weight by similarity and recency (recent hits more important)
-          const recencyFactor = 1 - (i / hist.length);
-          const w = sim * (0.4 + 0.6 * recencyFactor);
-          tally[next] += w;
-        }
-      }
-    }
-    const total = tally.T + tally.X;
-    if (total === 0) return null;
-    const pred = tally.T >= tally.X ? 'T' : 'X';
-    return { pred, conf: Math.min(0.98, Math.max(0.05, Math.max(tally.T, tally.X) / total)), reason: `RPP sim projection` };
-  } catch (e) { return null; }
-}
-
-/* ================= MARKET PROFILE (6 STATES) ============= */
-function classifyMarketState(his) {
-  // compute run density, streaks, entropy-ish metric
-  const window = Math.min(200, his.length);
-  if (window < 16) return "balanced";
-  const seq = seqNewestFirst(his, window);
-  // runs density
-  let runs = 1, last = seq[0];
-  for (let i = 1; i < seq.length; i++) {
-    if (seq[i] !== last) { runs++; last = seq[i]; }
-  }
-  const runDensity = runs / seq.length; // high => volatile
-  // average streak length
-  const streaks = [];
-  last = seq[0]; let curLen = 1;
-  for (let i = 1; i < seq.length; i++) {
-    if (seq[i] === last) curLen++; else { streaks.push(curLen); curLen = 1; last = seq[i]; }
-  }
-  streaks.push(curLen);
-  const avgStreak = streaks.reduce((a, b) => a + b, 0) / streaks.length;
-  const tcount = (seq.match(/T/g) || []).length, xcount = (seq.match(/X/g) || []).length;
-  const balance = Math.abs(tcount - xcount) / seq.length; // 0..1
-
-  // heuristics to 6 states
-  if (avgStreak >= 8 && balance > 0.25) return "ultra_trending";
-  if (avgStreak >= 5 && balance > 0.12) return "semi_trending";
-  if (runDensity > 0.6) return "high_volatile";
-  if (runDensity > 0.45) return "low_volatile";
-  if (balance < 0.06 && runDensity < 0.35) return "balanced";
-  // detect reverse phase (lots of alternating)
-  if (avgStreak <= 2 && runDensity > 0.55) return "reverse";
-  return "balanced";
-}
-
-/* ============== RISK CONTROL LAYER ============== */
-/*
-  If market state is risky (high_volatile or reverse) or model disagreements high => avoid hard predictions.
-*/
-function riskControlShouldSkip(his, ensembleConf) {
-  const state = classifyMarketState(his);
-  if (state === "high_volatile" || state === "reverse") return { skip: true, reason: `market ${state}` };
-  if (!ensembleConf || ensembleConf < 0.28) return { skip: true, reason: "low ensemble confidence" };
-  return { skip: false };
-}
-
-/* =================== V-ENGINE & ENSEMBLE =================== */
-function vEnginePredict(his) {
-  const models = [];
-  const pl = patternLookupPredict(his); if (pl) models.push({ n: "patternLookup", pred: pl.pred, conf: pl.conf, reason: pl.reason, weight: MEMORY.weights.patternLookup || 1.0 });
-  const fz = fuzzyMatchPredict(his); if (fz) models.push({ n: "fuzzy", pred: fz.pred, conf: fz.conf, reason: fz.reason, weight: MEMORY.weights.fuzzyMatch || 1.0 });
-  const tr = trendPredict(his); if (tr) models.push({ n: "trend", pred: tr.pred, conf: tr.conf, reason: tr.reason, weight: MEMORY.weights.trend || 1.0 });
-  const mo = momentumPredict(his); if (mo) models.push({ n: "momentum", pred: mo.pred, conf: mo.conf, reason: mo.reason, weight: MEMORY.weights.momentum || 1.0 });
-  const pr = powerRankPredict(his); if (pr) models.push({ n: "powerRank", pred: pr.pred, conf: pr.conf, reason: pr.reason, weight: MEMORY.weights.powerRank || 1.0 });
-  const oldm = oldSimplePredict(his); if (oldm && oldm.pred !== "N/A") models.push({ n: "oldSimple", pred: oldm.pred, conf: oldm.conf || 0.5, reason: oldm.reason, weight: MEMORY.weights.oldSimple || 0.7 });
-
-  if (!models.length) return { prediction: "N/A", confidence: 0, reasons: ["no models"] };
-
-  let score = { T: 0, X: 0 }, reasons = [];
-  const marketState = classifyMarketState(his);
-  const marketFactor = MEMORY.marketProfile.states[marketState] ? MEMORY.marketProfile.states[marketState].factor || 1 : 1;
-
-  models.forEach(m => {
-    const w = (m.weight || 1) * marketFactor;
-    const conf = Math.min(0.99, Math.max(0.01, m.conf || 0.5));
-    if (m.pred === 'T') score.T += w * conf; else score.X += w * conf;
-    reasons.push(`${m.n}:${m.reason}`);
-  });
-
-  const final = score.T >= score.X ? 'T' : 'X';
-  const conf = Math.max(0.01, Math.min(0.999, Math.max(score.T, score.X) / (score.T + score.X || 1)));
-  return { prediction: final, confidence: conf, reasons, marketState };
-}
-
-/* =================== UNIFIED PREDICT (with VIP influence) =================== */
-function unifiedPredict(his) {
-  // base engines
-  const v = vEnginePredict(his);
-  const a = akiraPredict(his);
-  const o = oldSimplePredict(his);
-
-  // combine base engines into baseScore
-  let baseScore = { T: 0, X: 0 }, baseReasons = [];
-  // vEngine larger share of base
-  if (v && v.prediction !== "N/A") { baseScore[v.prediction] += 0.55 * (v.confidence || v.conf || 0.5); baseReasons.push(...(v.reasons || []).slice(0, 3)); }
-  if (a && a.prediction !== "N/A") { baseScore[a.prediction] += 0.30 * (a.confidence || 0.5); baseReasons.push(...(a.reasons || []).slice(0, 2)); }
-  if (o && o.pred !== "N/A") { baseScore[o.pred] += 0.15 * (o.conf || 0.5); baseReasons.push(o.reason || "oldSimple"); }
-
-  // ensure baseScore scaled to BASE_ENGINE_PORTION
-  baseScore.T *= BASE_ENGINE_PORTION;
-  baseScore.X *= BASE_ENGINE_PORTION;
-
-  // VIP contribution
-  const vip = vipPredict(his);
-  if (vip && vip.pred) {
-    const vipConf = Math.min(0.99, Math.max(0.01, vip.conf || 0.8));
-    if (vip.pred === 'T') baseScore.T += VIP_INFLUENCE * vipConf;
-    else baseScore.X += VIP_INFLUENCE * vipConf;
-    baseReasons.push(`VIP:${vip.reason}(${(vipConf * 100).toFixed(0)}%)`);
-  } else {
-    // if no VIP match, optionally use RPP as substitute influence (small)
-    const rpp = recursivePatternProjection(his, 6, 1200);
-    if (rpp && rpp.pred) {
-      const rppConf = Math.min(0.85, Math.max(0.05, rpp.conf || 0.5));
-      if (rpp.pred === 'T') baseScore.T += (VIP_INFLUENCE * 0.35) * rppConf;
-      else baseScore.X += (VIP_INFLUENCE * 0.35) * rppConf;
-      baseReasons.push(`RPP:${rpp.reason}`);
+      count++;
     }
   }
-
-  // final ensemble
-  const final = baseScore.T >= baseScore.X ? 'T' : 'X';
-  const conf = Math.max(0.01, Math.min(0.999, Math.max(baseScore.T, baseScore.X) / (baseScore.T + baseScore.X || 1)));
-
-  // risk control: may skip prediction
-  const rc = riskControlShouldSkip(his, conf);
-  if (rc.skip) {
-    return { prediction: "N/A", confidence: conf, reasons: [...baseReasons, `risk:${rc.reason}`] };
-  }
-  return { prediction: final, confidence: conf, reasons: baseReasons.slice(0, 6) };
+  return count;
 }
 
-/* =================== FEEDBACK + APR (Auto-Pattern Reinforcement) =================== */
-async function feedbackUpdate(predictionShort, actualShort) {
-  try {
-    MEMORY.stats.totalPred = (MEMORY.stats.totalPred || 0) + 1;
-    if (predictionShort === actualShort) MEMORY.stats.totalCorrect = (MEMORY.stats.totalCorrect || 0) + 1;
-    // update suffix patterns performance and APR streaks
-    const his = await getHistory();
-    const recent = seqOldestFirst(his, 30);
-    const suffixes = [];
-    for (let L = MEMORY.settings.patternMinLen; L <= Math.min(MEMORY.settings.patternMaxLen, recent.length); L++) suffixes.push(recent.slice(-L));
-    suffixes.forEach(suf => {
-      const rec = MEMORY.patterns[suf];
-      if (rec) {
-        rec.lastSeen = Date.now();
-        if (predictionShort === actualShort) { rec.success = (rec.success || 0) + 1; rec.aprStreak = (rec.aprStreak || 0) + 1; }
-        else { rec.fail = (rec.fail || 0) + 1; rec.aprStreak = 0; }
-        const tot = (rec.success || 0) + (rec.fail || 0);
-        rec.score = tot > 0 ? (rec.success / tot) : rec.score || 0.5;
-        // APR discrete boost/penalty
-        if (rec.aprStreak >= 2) rec.score = Math.min(APR_MAX_SCORE, rec.score + APR_BOOST_STEP * rec.aprStreak);
-        if (rec.fail && rec.fail >= 2) rec.score = Math.max(0, rec.score - APR_PENALTY_STEP * rec.fail);
-        // lock out if failing too often
-        if ((rec.fail || 0) >= MEMORY.settings.lockoutAfterFails) rec.lockedUntil = Date.now() + 1000 * 60 * 30;
-      }
-    });
-    // adaptive weight tuning: small tweaks
-    const perf = MEMORY.stats.totalCorrect / Math.max(1, MEMORY.stats.totalPred);
-    // nudge weights slightly toward better engines (simple heuristic)
-    if (perf > 0.55) {
-      MEMORY.weights.patternLookup = Math.min(3, (MEMORY.weights.patternLookup || 1) * (1 + (perf - 0.5) * 0.02));
-      MEMORY.weights.akira = Math.min(2.5, (MEMORY.weights.akira || 1) * (1 + (perf - 0.5) * 0.015));
-    } else {
-      MEMORY.weights.patternLookup = Math.max(0.6, (MEMORY.weights.patternLookup || 1) * (1 - (0.52 - perf) * 0.03));
-    }
-    await saveMemory();
-  } catch (e) { console.error("feedbackUpdate err", e.message || e); }
-}
 
-/* ================= POLLING LOOP (seed & update) ================= */
-let pollingLock = false;
-async function updateLoop() {
-  if (pollingLock) return;
-  pollingLock = true;
-  try {
-    const remote = await fetchRemote();
-    if (!remote.length) return;
-    const newest = remote[0].phien;
-    const lastLocal = await getLatestPhienLocal();
-    if (newest > lastLocal) {
-      // push newest (may be multiple)
-      for (let i = 0; i < remote.length; i++) {
-        if (remote[i].phien > lastLocal) await pushHistory(remote[i]);
-      }
-      // periodic pattern DB updates
-      const his = await getHistory();
-      if ((his.length % MEMORY.settings.updatePatternEvery) === 0) { updatePatternDB(his); await saveMemory(); }
-    }
-  } catch (e) { console.error("updateLoop err", e.message || e); }
-  finally { pollingLock = false; }
-}
-setInterval(updateLoop, POLL_INTERVAL);
-updateLoop();
+/* ================ API Endpoints ================ */
 
-/* =================== ROUTES =================== */
-app.get("/", (req, res) => res.json({ status: "XENG17 SUPREME running", id: MY_ID }));
-
-app.get("/xocdia88", async (req, res) => {
-  try {
-    const his = await getHistory();
-    if (!his.length) return res.json({ error: "History loading, wait few seconds" });
-    const cur = his[0];
-    const u = unifiedPredict(his);
-    const conv = v => v === "T" ? "Tài" : v === "X" ? "Xỉu" : v;
-    res.json({
-      id: MY_ID,
-      phien: cur.phien,
-      xuc_xac_1: cur.x1,
-      xuc_xac_2: cur.x2,
-      xuc_xac_3: cur.x3,
-      tong: cur.tong,
-      ket_qua: conv(cur.kq),
-      phien_hien_tai: cur.phien + 1,
-      du_doan: conv(u.prediction),
-      confidence: Math.round((u.confidence || 0) * 100),
-      reasons: u.reasons || []
-    });
-  } catch (e) { res.status(500).json({ error: e.message || e }); }
+// Health Check
+app.get("/", (req, res) => {
+  res.json({ status: "ok", service: MY_ID, uptime: process.uptime() });
 });
 
-app.get("/his", async (req, res) => res.json(await getHistory()));
+// Main prediction endpoint
+app.get("/api/predict", async (req, res) => {
+  const history = await getHistory(15); // Get the last 15 results
+  const prediction = predictNext(history);
+  const topPatterns = Object.entries(memory.patterns)
+    .filter(([k, v]) => !v.is_vip) // Filter out pure VIP patterns
+    .sort(([, a], [, b]) => b.score - a.score)
+    .map(([key, value]) => ({ key, score: value.score, wins: value.wins, fails: value.fails }));
 
-app.get("/debug", async (req, res) => {
-  const mem = MEMORY;
-  const arr = Object.keys(mem.patterns || {}).map(p => ({ p, ...mem.patterns[p] }));
-  arr.sort((a, b) => ((b.score || 0) * (b.count || 0)) - ((a.score || 0) * (a.count || 0)));
   res.json({
-    id: MY_ID,
-    memorySummary: { totalPatterns: Object.keys(mem.patterns || {}).length, weights: mem.weights, stats: mem.stats },
+    prediction: prediction.prediction,
+    score: prediction.score,
+    weights: prediction.weights,
+    details: {
+      totalPatterns: memory.stats.learned,
+      totalCycles: memory.stats.total,
+      hits: memory.stats.hits,
+      fails: memory.stats.fails,
+      vipMatches: prediction.vipMatches,
+      marketState: classifyMarketState(await getHistory(200)),
+    },
+    topPatterns: topPatterns.slice(0, 60), // Return top 60 non-VIP patterns
+  });
+});
+
+/* Admin: view memory */
+app.get("/admin/memory", async (req, res) => {
+  const arr = Object.entries(memory.patterns).map(([key, mem]) => ({ key, ...mem }));
+  res.json({
+    memory: { totalPatterns: arr.length, weights: memory.weights, stats: memory.stats },
     topPatterns: arr.slice(0, 60),
     marketSample: classifyMarketState(await getHistory(200))
   });
@@ -10692,6 +10381,24 @@ async function persistAll() { try { await saveMemory(); } catch (e) { console.er
 process.on("SIGINT", async () => { await persistAll(); process.exit(0); });
 process.on("SIGTERM", async () => { await persistAll(); process.exit(0); });
 
+/* ================ API Poller (REVISED) ================ */
+
+/**
+ * Sử dụng setTimeout đệ quy để đảm bảo request tiếp theo
+ * chỉ chạy sau khi request trước hoàn tất và đợi hết interval.
+ */
+async function pollApiLoop() {
+  try {
+    await pollApiAndLearn();
+  } catch (e) {
+    // Log lỗi nhưng không làm dừng vòng lặp polling
+    console.error("Error during API poll loop:", e.message || e);
+  } finally {
+    // Luôn luôn thiết lập thời gian chờ cho lần thăm dò tiếp theo
+    setTimeout(pollApiLoop, POLL_INTERVAL);
+  }
+}
+
 /* ================ INIT ================ */
 (async () => {
   await loadMemory();
@@ -10699,12 +10406,16 @@ process.on("SIGTERM", async () => { await persistAll(); process.exit(0); });
   loadVipFromTextAndInject(VIP_PATTERNS_TEXT);
   // seed history if empty
   const existing = await getHistory(1);
-  if (!existing.length) {
-    const remote = await fetchRemote(10);
-    if (remote.length) {
-      for (let i = remote.length - 1; i >= 0; i--) await pushHistory(remote[i]);
-    }
+  if (!existing || existing.length === 0) {
+    console.log("History is empty, fetching initial data...");
+    await pollApiAndLearn(); // Initial fetch
   }
-  console.log("Server ready. history len:", (await getHistory(5)).length);
-  app.listen(PORT, () => console.log(`XENG17 listening on ${PORT}`));
+
+  // Bắt đầu vòng lặp polling API
+  pollApiLoop();
+
+  // Start server
+  app.listen(PORT, () => {
+    console.log(`Server running on port ${PORT}`);
+  });
 })();
