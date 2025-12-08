@@ -6,29 +6,39 @@ const { Redis } = require("@upstash/redis");
 const app = express();
 app.use(cors());
 app.use(express.json());
+
+/* ===================== CONFIG ===================== */
 const PORT = process.env.PORT || 3000;
 const MY_ID = process.env.MY_ID || "tiendat";
 const API_URL = process.env.API_URL || "https://taixiu.system32-cloudfare-356783752985678522.monster/api/luckydice/GetSoiCau";
 const MAX_HIS = Number(process.env.MAX_HIS) || 1000;
-const POLL_INTERVAL = Number(process.env.POLL_INTERVAL_MS) || 8000;
+// ĐÃ SỬA: Tăng thời gian polling mặc định từ 8000ms lên 30000ms để tiết kiệm Redis requests.
+const POLL_INTERVAL = Number(process.env.POLL_INTERVAL_MS) || 30000; 
 const VIP_INFLUENCE = Number(process.env.VIP_INFLUENCE) || 0.40; // VIP weight portion (default 0.40)
 const BASE_ENGINE_PORTION = Math.max(0, 1 - VIP_INFLUENCE); // rest assigned to other engines
 const APR_BOOST_STEP = 0.06; // how much to boost pattern.score on consecutive wins
 const APR_PENALTY_STEP = 0.05; // penalty on fails
 const APR_MAX_SCORE = 1.5; // cap multiplier
 const APR_MIN_SCORE = 0.1;
+/* ================================================== */
+
+/* ================ Upstash Redis client ============== */
+
+let redis;
+let isRedisReady = false;
 
 if (!process.env.UPSTASH_REDIS_REST_URL || !process.env.UPSTASH_REDIS_REST_TOKEN) {
-  console.error("==========================================================================");
-  console.error("CRITICAL ERROR: Missing UPSTASH_REDIS_REST_URL or UPSTASH_REDIS_REST_TOKEN env vars.");
-  console.error("Application cannot run without Redis connection details. Please configure on Render.");
-  console.error("==========================================================================");
-  process.exit(1);
+    console.error("==========================================================================");
+    console.error("WARNING: Missing UPSTASH_REDIS_REST_URL or UPSTASH_REDIS_REST_TOKEN env vars.");
+    console.error("Application will run, but persistence and learning via Redis will be disabled (or fail).");
+    console.error("==========================================================================");
+} else {
+    redis = new Redis({
+        url: process.env.UPSTASH_REDIS_REST_URL,
+        token: process.env.UPSTASH_REDIS_REST_TOKEN,
+    });
+    isRedisReady = true;
 }
-const redis = new Redis({
-  url: process.env.UPSTASH_REDIS_REST_URL,
-  token: process.env.UPSTASH_REDIS_REST_TOKEN,
-});
 
 /* ================ Redis keys ================ */
 const MEM_KEY = MY_ID + ":memory";
@@ -36,117 +46,137 @@ const HIS_KEY = MY_ID + ":history";
 
 /* ================ Core structures ================ */
 let memory = {
-  patterns: {}, // { 'pattern_string': { wins: N, fails: M, score: S } }
-  weights: { "1": 0.5, "2": 0.5 }, // Total weight
-  stats: { total: 0, learned: 0, matched: 0, hits: 0, fails: 0, vip: 0 },
+    patterns: {}, // { 'pattern_string': { wins: N, fails: M, score: S } }
+    weights: { "1": 0.5, "2": 0.5 }, // Total weight
+    stats: { total: 0, learned: 0, matched: 0, hits: 0, fails: 0, vip: 0 },
 };
 
 /* ================ Memory/Persistence ================ */
 
 async function loadMemory() {
-  const memData = await redis.get(MEM_KEY);
-  if (memData) {
-    try {
-      memory = { ...memory, ...memData };
-      console.log("Loaded memory from redis - patterns:", memory.stats.learned);
-    } catch (e) {
-      console.error("Failed to parse memory data, using default.", e);
+    if (!isRedisReady) {
+        console.warn("Redis is not ready. Using in-memory store.");
+        return;
     }
-  } else {
-    console.log("Initialized memory in redis");
-    await saveMemory();
-  }
+    const memData = await redis.get(MEM_KEY);
+    if (memData) {
+        try {
+            memory = { ...memory, ...memData };
+            console.log("Loaded memory from redis - patterns:", memory.stats.learned);
+        } catch (e) {
+            console.error("Failed to parse memory data, using default.", e);
+        }
+    } else {
+        console.log("Initialized memory in redis");
+        await saveMemory();
+    }
 }
 
 async function saveMemory() {
-  await redis.set(MEM_KEY, memory);
+    if (!isRedisReady) return;
+    try {
+        await redis.set(MEM_KEY, memory);
+    } catch (e) {
+        console.error("Failed to save memory to Redis (Hết giới hạn lệnh?):", e.message);
+    }
 }
 
 /* ================ History ================ */
 
 async function getHistory(limit) {
-  // zrevrange (from highest score to lowest)
-  return redis.zrevrange(HIS_KEY, 0, limit - 1);
+    if (!isRedisReady) return [];
+    try {
+        // zrevrange (from highest score to lowest)
+        return redis.zrevrange(HIS_KEY, 0, limit - 1);
+    } catch (e) {
+        console.error("Failed to get history from Redis (Hết giới hạn lệnh?):", e.message);
+        return [];
+    }
 }
 
 async function setHistory(data) {
-  // Use ZADD (Sorted Set) to store history, using timestamp as score to keep order
-  const timestamp = Date.now();
-  await redis.zadd(HIS_KEY, { score: timestamp, member: data });
-  // Trim the list to MAX_HIS to keep memory usage low
-  await redis.zremrangebyrank(HIS_KEY, 0, -(MAX_HIS + 1));
+    if (!isRedisReady) return;
+    try {
+        // Use ZADD (Sorted Set) to store history, using timestamp as score to keep order
+        const timestamp = Date.now();
+        await redis.zadd(HIS_KEY, { score: timestamp, member: data });
+        // Trim the list to MAX_HIS to keep memory usage low
+        await redis.zremrangebyrank(HIS_KEY, 0, -(MAX_HIS + 1));
+    } catch (e) {
+        console.error("Failed to set history to Redis (Hết giới hạn lệnh?):", e.message);
+    }
 }
 
 /* ================ Pattern Learning (APR - Adaptive Pattern Recognition) ================ */
 
 function getPattern(historyArr, length) {
-  if (historyArr.length < length) return null;
-  // Patterns are reversed, so the most recent result is at position 0
-  return historyArr.slice(0, length).join("");
+    if (historyArr.length < length) return null;
+    // Patterns are reversed, so the most recent result is at position 0
+    return historyArr.slice(0, length).join("");
 }
 
 function normalizeWeights(weights) {
-  const total = Object.values(weights).reduce((a, b) => a + b, 0);
-  if (total === 0) return weights;
-  const normalized = {};
-  for (const key in weights) {
-    normalized[key] = weights[key] / total;
-  }
-  return normalized;
+    const total = Object.values(weights).reduce((a, b) => a + b, 0);
+    if (total === 0) return weights;
+    const normalized = {};
+    for (const key in weights) {
+        normalized[key] = weights[key] / total;
+    }
+    return normalized;
 }
 
 // 0 - fail, 1 - win
 function updatePatternScore(patternKey, result) {
-  if (!memory.patterns[patternKey]) return;
+    if (!memory.patterns[patternKey]) return;
 
-  let p = memory.patterns[patternKey];
-  let currentScore = p.score || 1.0;
+    let p = memory.patterns[patternKey];
+    let currentScore = p.score || 1.0;
 
-  if (result === 1) {
-    // Win: boost score
-    p.wins++;
-    currentScore = Math.min(APR_MAX_SCORE, currentScore + APR_BOOST_STEP);
-    memory.stats.hits++;
-  } else {
-    // Fail: penalize score
-    p.fails++;
-    currentScore = Math.max(APR_MIN_SCORE, currentScore - APR_PENALTY_STEP);
-    memory.stats.fails++;
-  }
-  p.score = currentScore;
+    if (result === 1) {
+        // Win: boost score
+        p.wins++;
+        currentScore = Math.min(APR_MAX_SCORE, currentScore + APR_BOOST_STEP);
+        memory.stats.hits++;
+    } else {
+        // Fail: penalize score
+        p.fails++;
+        currentScore = Math.max(APR_MIN_SCORE, currentScore - APR_PENALTY_STEP);
+        memory.stats.fails++;
+    }
+    p.score = currentScore;
 }
 
 function learn(history) {
-  if (history.length < 2) return;
+    if (history.length < 2) return;
 
-  // The result of the second-most recent entry determines the outcome
-  // The pattern leading to the second-most recent result is the third-most recent onwards
-  const outcome = history[1]; // Result of the history[1] entry
-  const precedingPattern = history.slice(2, history.length);
+    // The result of the second-most recent entry determines the outcome
+    // The pattern leading to the second-most recent result is the third-most recent onwards
+    const outcome = history[1]; // Result of the history[1] entry
+    const precedingPattern = history.slice(2, history.length);
 
-  // We learn based on the outcome of the **previous** turn
-  // Patterns are extracted from the list starting from the 3rd element
-  // e.g. [current, prev_result, prev_pattern_3, prev_pattern_2, ...]
-  for (let length = 1; length <= 15; length++) {
-    const patternStr = getPattern(precedingPattern, length);
-    if (!patternStr) continue;
+    // We learn based on the outcome of the **previous** turn
+    // Patterns are extracted from the list starting from the 3rd element
+    // e.g. [current, prev_result, prev_pattern_3, prev_pattern_2, ...]
+    for (let length = 1; length <= 15; length++) {
+        const patternStr = getPattern(precedingPattern, length);
+        if (!patternStr) continue;
 
-    const key = patternStr;
-    const nextOutcome = outcome; // The result *following* this pattern
+        const key = patternStr;
+        const nextOutcome = outcome; // The result *following* this pattern
 
-    if (!memory.patterns[key]) {
-      memory.patterns[key] = { wins: 0, fails: 0, score: 1.0, is_vip: false, vip_win_rate: 0.0 };
-      memory.stats.learned++;
+        if (!memory.patterns[key]) {
+            memory.patterns[key] = { wins: 0, fails: 0, score: 1.0, is_vip: false, vip_win_rate: 0.0 };
+            memory.stats.learned++;
+        }
+
+        if (nextOutcome === 't') { // TÀI
+            updatePatternScore(key, nextOutcome === 't' ? 1 : 0);
+        } else if (nextOutcome === 'x') { // XỈU
+            updatePatternScore(key, nextOutcome === 'x' ? 1 : 0);
+        }
     }
 
-    if (nextOutcome === 't') { // TÀI
-      updatePatternScore(key, nextOutcome === 't' ? 1 : 0);
-    } else if (nextOutcome === 'x') { // XỈU
-      updatePatternScore(key, nextOutcome === 'x' ? 1 : 0);
-    }
-  }
-
-  memory.stats.total++;
+    memory.stats.total++;
 }
 
 
@@ -160,13 +190,13 @@ function learn(history) {
  * @param {string[]} history - Array of 't' and 'x' results.
  */
 function classifyMarketState(history) {
-  if (history.length === 0) return 0;
-  const countT = history.filter(r => r === 't').length;
-  const countX = history.filter(r => r === 'x').length;
+    if (history.length === 0) return 0;
+    const countT = history.filter(r => r === 't').length;
+    const countX = history.filter(r => r === 'x').length;
 
-  if (countT > countX) return 1; // Market favors Tài
-  if (countX > countT) return 2; // Market favors Xỉu
-  return 0; // Balanced
+    if (countT > countX) return 1; // Market favors Tài
+    if (countX > countT) return 2; // Market favors Xỉu
+    return 0; // Balanced
 }
 
 /**
@@ -175,111 +205,126 @@ function classifyMarketState(history) {
  * @returns {object} { prediction: 't'|'x', score: number }
  */
 function predictNext(currentHistory) {
-  const currentWeights = { t: 0, x: 0 };
-  const matchedPatterns = [];
+    const currentWeights = { t: 0, x: 0 };
+    const matchedPatterns = [];
 
-  // --- 1. Pattern Matching Engine (70% - BASE_ENGINE_PORTION) ---
-  for (let length = 1; length <= 15; length++) {
-    const patternStr = getPattern(currentHistory, length);
-    if (!patternStr) continue;
+    // --- 1. Pattern Matching Engine (70% - BASE_ENGINE_PORTION) ---
+    for (let length = 1; length <= 15; length++) {
+        const patternStr = getPattern(currentHistory, length);
+        if (!patternStr) continue;
 
-    const pattern = memory.patterns[patternStr];
-    if (pattern) {
-      memory.stats.matched++;
-      matchedPatterns.push({ key: patternStr, ...pattern });
+        const pattern = memory.patterns[patternStr];
+        if (pattern) {
+            memory.stats.matched++;
+            matchedPatterns.push({ key: patternStr, ...pattern });
 
-      // Apply the pattern's score to the next outcome
-      // Pushing 't' weight
-      const t_key = patternStr + 't';
-      const x_key = patternStr + 'x';
-      const t_pattern = memory.patterns[t_key];
-      const x_pattern = memory.patterns[x_key];
+            // Apply the pattern's score to the next outcome
+            // Pushing 't' weight
+            const t_key = patternStr + 't';
+            const x_key = patternStr + 'x';
+            const t_pattern = memory.patterns[t_key];
+            const x_pattern = memory.patterns[x_key];
 
-      if (t_pattern) {
-        currentWeights.t += (t_pattern.score || 1.0);
-      }
-      if (x_pattern) {
-        currentWeights.x += (x_pattern.score || 1.0);
-      }
+            if (t_pattern) {
+                currentWeights.t += (t_pattern.score || 1.0);
+            }
+            if (x_pattern) {
+                currentWeights.x += (x_pattern.score || 1.0);
+            }
+        }
     }
-  }
 
-  // Fallback if no patterns matched (highly unlikely)
-  if (currentWeights.t === 0 && currentWeights.x === 0) {
-    currentWeights.t = 1;
-    currentWeights.x = 1;
-  }
-
-  // Normalize pattern weights
-  const patternTotal = currentWeights.t + currentWeights.x;
-  const patternWeightT = currentWeights.t / patternTotal;
-  const patternWeightX = currentWeights.x / patternTotal;
-
-  // --- 2. VIP Pattern Engine (30% - VIP_INFLUENCE) ---
-  let vipWeightT = 0;
-  let vipWeightX = 0;
-  let vipMatches = 0;
-
-  for (const key in memory.patterns) {
-    const p = memory.patterns[key];
-    if (p.is_vip && key.startsWith(currentHistory.join(""))) {
-      vipMatches++;
-      if (p.vip_win_rate > 0.5) {
-        vipWeightT += p.vip_win_rate;
-      } else {
-        vipWeightX += (1 - p.vip_win_rate);
-      }
+    // Fallback if no patterns matched (highly unlikely)
+    if (currentWeights.t === 0 && currentWeights.x === 0) {
+        currentWeights.t = 1;
+        currentWeights.x = 1;
     }
-  }
 
-  if (vipMatches > 0) {
-    const vipTotal = vipWeightT + vipWeightX;
-    vipWeightT = vipWeightT / vipTotal;
-    vipWeightX = vipWeightX / vipTotal;
-    memory.stats.vip = vipMatches;
-  } else {
-    vipWeightT = 0.5; 
-    vipWeightX = 0.5; 
-  }
+    // Normalize pattern weights
+    const patternTotal = currentWeights.t + currentWeights.x;
+    const patternWeightT = currentWeights.t / patternTotal;
+    const patternWeightX = currentWeights.x / patternTotal;
 
-  // --- 3. Final Weighted Prediction ---
-  const finalWeightT = (patternWeightT * BASE_ENGINE_PORTION) + (vipWeightT * VIP_INFLUENCE);
-  const finalWeightX = (patternWeightX * BASE_ENGINE_PORTION) + (vipWeightX * VIP_INFLUENCE);
+    // --- 2. VIP Pattern Engine (30% - VIP_INFLUENCE) ---
+    let vipWeightT = 0;
+    let vipWeightX = 0;
+    let vipMatches = 0;
 
-  const finalTotal = finalWeightT + finalWeightX;
-  const finalNormalizedT = finalWeightT / finalTotal;
-  const finalNormalizedX = finalWeightX / finalTotal;
+    for (const key in memory.patterns) {
+        const p = memory.patterns[key];
+        if (p.is_vip && key.startsWith(currentHistory.join(""))) {
+            vipMatches++;
+            // If the current history is a prefix of a VIP pattern
+            // Apply the VIP win rate directly
+            if (p.vip_win_rate > 0.5) {
+                vipWeightT += p.vip_win_rate;
+            } else {
+                vipWeightX += (1 - p.vip_win_rate);
+            }
+        }
+    }
 
-  const finalPrediction = finalNormalizedT > finalNormalizedX ? 't' : 'x';
+    if (vipMatches > 0) {
+        const vipTotal = vipWeightT + vipWeightX;
+        vipWeightT = vipWeightT / vipTotal;
+        vipWeightX = vipWeightX / vipTotal;
+        memory.stats.vip = vipMatches;
+    } else {
+        // If no VIP match, distribute the influence to the base engine
+        vipWeightT = 0.5; // Neutral
+        vipWeightX = 0.5; // Neutral
+    }
 
-  return {
-    prediction: finalPrediction,
-    score: Math.max(finalNormalizedT, finalNormalizedX),
-    weights: { t: finalNormalizedT, x: finalNormalizedX },
-    matchedPatterns: matchedPatterns,
-    vipMatches: vipMatches
-  };
+    // --- 3. Final Weighted Prediction ---
+    const finalWeightT = (patternWeightT * BASE_ENGINE_PORTION) + (vipWeightT * VIP_INFLUENCE);
+    const finalWeightX = (patternWeightX * BASE_ENGINE_PORTION) + (vipWeightX * VIP_INFLUENCE);
+
+    const finalTotal = finalWeightT + finalWeightX;
+    const finalNormalizedT = finalWeightT / finalTotal;
+    const finalNormalizedX = finalWeightX / finalTotal;
+
+    const finalPrediction = finalNormalizedT > finalNormalizedX ? 't' : 'x';
+
+    return {
+        prediction: finalPrediction,
+        score: Math.max(finalNormalizedT, finalNormalizedX),
+        weights: { t: finalNormalizedT, x: finalNormalizedX },
+        matchedPatterns: matchedPatterns,
+        vipMatches: vipMatches
+    };
 }
 
+/* ================ API Polling and Learning ================ */
+
+// Đã sửa lại cơ chế polling để dùng setTimeout đệ quy, ổn định hơn setInterval
 async function pollApiAndLearn() {
-  try {
-    const response = await axios.get(API_URL);
-    const data = response.data.data;
-    if (!data || data.length === 0) return;
-    const results = data.map(item => item.betType === 1 ? 't' : 'x');
-    learn(results);
-    const latestResult = results[0];
-    await setHistory(latestResult);
+    try {
+        const response = await axios.get(API_URL);
+        const data = response.data.data;
+        if (!data || data.length === 0) return;
 
-    // 3. Save memory (patterns)
-    await saveMemory();
+        // The data is an array of objects like { betType: 1 or 2 }
+        // 1: Tài (t), 2: Xỉu (x)
+        const results = data.map(item => item.betType === 1 ? 't' : 'x');
 
-    console.log(`[${new Date().toLocaleTimeString()}] Polled API: Latest=${latestResult}, Learned=${memory.stats.learned}`);
+        // 1. Learn from previous results
+        learn(results);
 
-  } catch (error) {
-    console.error("Error during API polling:", error.message || error);
-  }
+        // 2. Save the new history
+        const latestResult = results[0];
+        await setHistory(latestResult);
+
+        // 3. Save memory (patterns)
+        await saveMemory();
+
+        console.log(`[${new Date().toLocaleTimeString()}] Polled API: Latest=${latestResult}, Learned=${memory.stats.learned}`);
+
+    } catch (error) {
+        console.error("Error during API polling:", error.message || error);
+    }
 }
+
+// ====================== VIP Pattern injection ======================
 const VIP_PATTERNS_TEXT = `
 1. XTXXTXTTXXTTXX - X
 2. XXTXTTXXXTTXXT - X
@@ -10286,34 +10331,34 @@ const VIP_PATTERNS_TEXT = `
 /**
  * Loads VIP patterns from a text block and injects them into the memory.
  * They are marked with is_vip: true.
- * @param {string} text 
- * @returns {number}
+ * @param {string} text - Text block containing patterns and win rates (e.g., 't:0.60;').
+ * @returns {number} Number of VIP patterns loaded.
  */
 function loadVipFromTextAndInject(text) {
-  let count = 0;
-  const lines = text.trim().split(';');
+    let count = 0;
+    const lines = text.trim().split(';');
 
-  for (const line of lines) {
-    const trimmedLine = line.trim();
-    if (trimmedLine.length === 0) continue;
+    for (const line of lines) {
+        const trimmedLine = line.trim();
+        if (trimmedLine.length === 0) continue;
 
-    const [pattern, rateStr] = trimmedLine.split(':');
-    const rate = parseFloat(rateStr);
+        const [pattern, rateStr] = trimmedLine.split(':');
+        const rate = parseFloat(rateStr);
 
-    if (pattern && rate && !isNaN(rate)) {
-      const key = pattern.toLowerCase();
-      if (!memory.patterns[key]) {
-        memory.patterns[key] = { wins: 0, fails: 0, score: 1.0, is_vip: true, vip_win_rate: rate };
-        memory.stats.learned++;
-      } else {
-        // Update existing pattern
-        memory.patterns[key].is_vip = true;
-        memory.patterns[key].vip_win_rate = rate;
-      }
-      count++;
+        if (pattern && rate && !isNaN(rate)) {
+            const key = pattern.toLowerCase();
+            if (!memory.patterns[key]) {
+                memory.patterns[key] = { wins: 0, fails: 0, score: 1.0, is_vip: true, vip_win_rate: rate };
+                memory.stats.learned++;
+            } else {
+                // Update existing pattern
+                memory.patterns[key].is_vip = true;
+                memory.patterns[key].vip_win_rate = rate;
+            }
+            count++;
+        }
     }
-  }
-  return count;
+    return count;
 }
 
 
@@ -10321,63 +10366,64 @@ function loadVipFromTextAndInject(text) {
 
 // Health Check
 app.get("/", (req, res) => {
-  res.json({ status: "ok", service: MY_ID, uptime: process.uptime() });
+    res.json({ status: "ok", service: MY_ID, uptime: process.uptime() });
 });
 
 // Main prediction endpoint
 app.get("/api/predict", async (req, res) => {
-  const history = await getHistory(15); // Get the last 15 results
-  const prediction = predictNext(history);
-  const topPatterns = Object.entries(memory.patterns)
-    .filter(([k, v]) => !v.is_vip) // Filter out pure VIP patterns
-    .sort(([, a], [, b]) => b.score - a.score)
-    .map(([key, value]) => ({ key, score: value.score, wins: value.wins, fails: value.fails }));
+    const history = await getHistory(15); // Get the last 15 results
+    const prediction = predictNext(history);
+    const topPatterns = Object.entries(memory.patterns)
+        .filter(([k, v]) => !v.is_vip) // Filter out pure VIP patterns
+        .sort(([, a], [, b]) => b.score - a.score)
+        .map(([key, value]) => ({ key, score: value.score, wins: value.wins, fails: value.fails }));
 
-  res.json({
-    prediction: prediction.prediction,
-    score: prediction.score,
-    weights: prediction.weights,
-    details: {
-      totalPatterns: memory.stats.learned,
-      totalCycles: memory.stats.total,
-      hits: memory.stats.hits,
-      fails: memory.stats.fails,
-      vipMatches: prediction.vipMatches,
-      marketState: classifyMarketState(await getHistory(200)),
-    },
-    topPatterns: topPatterns.slice(0, 60), // Return top 60 non-VIP patterns
-  });
+    res.json({
+        prediction: prediction.prediction,
+        score: prediction.score,
+        weights: prediction.weights,
+        details: {
+            totalPatterns: memory.stats.learned,
+            totalCycles: memory.stats.total,
+            hits: memory.stats.hits,
+            fails: memory.stats.fails,
+            vipMatches: prediction.vipMatches,
+            marketState: classifyMarketState(await getHistory(200)),
+        },
+        topPatterns: topPatterns.slice(0, 60), // Return top 60 non-VIP patterns
+    });
 });
 
 /* Admin: view memory */
 app.get("/admin/memory", async (req, res) => {
-  const arr = Object.entries(memory.patterns).map(([key, mem]) => ({ key, ...mem }));
-  res.json({
-    memory: { totalPatterns: arr.length, weights: memory.weights, stats: memory.stats },
-    topPatterns: arr.slice(0, 60),
-    marketSample: classifyMarketState(await getHistory(200))
-  });
+    const arr = Object.entries(memory.patterns).map(([key, mem]) => ({ key, ...mem }));
+    res.json({
+        memory: { totalPatterns: arr.length, weights: memory.weights, stats: memory.stats },
+        topPatterns: arr.slice(0, 60),
+        marketSample: classifyMarketState(await getHistory(200))
+    });
 });
 
 /* Admin: reload VIP content embedded */
 app.get("/admin/reload-vip", async (req, res) => {
-  try {
-    const n = loadVipFromTextAndInject(VIP_PATTERNS_TEXT);
-    await saveMemory();
-    res.json({ loaded: n });
-  } catch (e) { res.status(500).json({ error: e.message || e }); }
+    try {
+        const n = loadVipFromTextAndInject(VIP_PATTERNS_TEXT);
+        await saveMemory();
+        res.json({ loaded: n });
+    } catch (e) { res.status(500).json({ error: e.message || e }); }
 });
 
 /* Admin: wipe history (danger) */
 app.post("/admin/wipe-history", async (req, res) => {
-  try {
-    await redis.del(HIS_KEY);
-    res.json({ ok: true });
-  } catch (e) { res.status(500).json({ error: e.message || e }); }
+    if (!isRedisReady) return res.status(400).json({ error: "Redis is not active." });
+    try {
+        await redis.del(HIS_KEY);
+        res.json({ ok: true });
+    } catch (e) { res.status(500).json({ error: e.message || e }); }
 });
 
 /* Graceful persist */
-async function persistAll() { try { await saveMemory(); } catch (e) { console.error(e); } }
+async function persistAll() { await saveMemory(); }
 process.on("SIGINT", async () => { await persistAll(); process.exit(0); });
 process.on("SIGTERM", async () => { await persistAll(); process.exit(0); });
 
@@ -10388,34 +10434,34 @@ process.on("SIGTERM", async () => { await persistAll(); process.exit(0); });
  * chỉ chạy sau khi request trước hoàn tất và đợi hết interval.
  */
 async function pollApiLoop() {
-  try {
-    await pollApiAndLearn();
-  } catch (e) {
-    // Log lỗi nhưng không làm dừng vòng lặp polling
-    console.error("Error during API poll loop:", e.message || e);
-  } finally {
-    // Luôn luôn thiết lập thời gian chờ cho lần thăm dò tiếp theo
-    setTimeout(pollApiLoop, POLL_INTERVAL);
-  }
+    try {
+        await pollApiAndLearn();
+    } catch (e) {
+        // Log lỗi nhưng không làm dừng vòng lặp polling
+        console.error("Error during API poll loop:", e.message || e);
+    } finally {
+        // Luôn luôn thiết lập thời gian chờ cho lần thăm dò tiếp theo
+        setTimeout(pollApiLoop, POLL_INTERVAL);
+    }
 }
 
 /* ================ INIT ================ */
 (async () => {
-  await loadMemory();
-  // inject VIP from embedded text
-  loadVipFromTextAndInject(VIP_PATTERNS_TEXT);
-  // seed history if empty
-  const existing = await getHistory(1);
-  if (!existing || existing.length === 0) {
-    console.log("History is empty, fetching initial data...");
-    await pollApiAndLearn(); // Initial fetch
-  }
+    await loadMemory();
+    // inject VIP from embedded text
+    loadVipFromTextAndInject(VIP_PATTERNS_TEXT);
+    // seed history if empty
+    const existing = await getHistory(1);
+    if (!existing || existing.length === 0) {
+        console.log("History is empty, fetching initial data...");
+        await pollApiAndLearn(); // Initial fetch
+    }
 
-  // Bắt đầu vòng lặp polling API
-  pollApiLoop();
+    // Bắt đầu vòng lặp polling API
+    pollApiLoop();
 
-  // Start server
-  app.listen(PORT, () => {
-    console.log(`Server running on port ${PORT}`);
-  });
+    // Start server
+    app.listen(PORT, () => {
+        console.log(`Server running on port ${PORT}`);
+    });
 })();
