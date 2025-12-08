@@ -12,7 +12,7 @@ const PORT = process.env.PORT || 3000;
 const MY_ID = process.env.MY_ID || "tiendat";
 const API_URL = process.env.API_URL || "https://taixiu.system32-cloudfare-356783752985678522.monster/api/luckydice/GetSoiCau";
 const MAX_HIS = Number(process.env.MAX_HIS) || 1000;
-// ĐÃ SỬA: Tăng thời gian polling mặc định từ 8000ms lên 30000ms để tiết kiệm Redis requests.
+// Tăng thời gian polling mặc định từ 8000ms lên 30000ms để tiết kiệm Redis requests
 const POLL_INTERVAL = Number(process.env.POLL_INTERVAL_MS) || 30000; 
 const VIP_INFLUENCE = Number(process.env.VIP_INFLUENCE) || 0.40; // VIP weight portion (default 0.40)
 const BASE_ENGINE_PORTION = Math.max(0, 1 - VIP_INFLUENCE); // rest assigned to other engines
@@ -33,11 +33,15 @@ if (!process.env.UPSTASH_REDIS_REST_URL || !process.env.UPSTASH_REDIS_REST_TOKEN
     console.error("Application will run, but persistence and learning via Redis will be disabled (or fail).");
     console.error("==========================================================================");
 } else {
-    redis = new Redis({
-        url: process.env.UPSTASH_REDIS_REST_URL,
-        token: process.env.UPSTASH_REDIS_REST_TOKEN,
-    });
-    isRedisReady = true;
+    try {
+        redis = new Redis({
+            url: process.env.UPSTASH_REDIS_REST_URL,
+            token: process.env.UPSTASH_REDIS_REST_TOKEN,
+        });
+        isRedisReady = true;
+    } catch (e) {
+        console.error("Error creating Redis client:", e.message);
+    }
 }
 
 /* ================ Redis keys ================ */
@@ -52,50 +56,58 @@ let memory = {
 };
 
 /* ================ Memory/Persistence ================ */
+let isPersistenceFailed = false; // Biến cờ để biết nếu lỗi Upstash
 
 async function loadMemory() {
-    if (!isRedisReady) {
-        console.warn("Redis is not ready. Using in-memory store.");
+    if (!isRedisReady || isPersistenceFailed) {
+        console.warn("Redis is not ready or has failed. Using in-memory store.");
         return;
     }
-    const memData = await redis.get(MEM_KEY);
-    if (memData) {
-        try {
-            memory = { ...memory, ...memData };
-            console.log("Loaded memory from redis - patterns:", memory.stats.learned);
-        } catch (e) {
-            console.error("Failed to parse memory data, using default.", e);
+    try {
+        const memData = await redis.get(MEM_KEY);
+        if (memData) {
+            try {
+                memory = { ...memory, ...memData };
+                console.log("Loaded memory from redis - patterns:", memory.stats.learned);
+            } catch (e) {
+                console.error("Failed to parse memory data, using default.", e);
+            }
+        } else {
+            console.log("Initialized memory in redis");
+            await saveMemory();
         }
-    } else {
-        console.log("Initialized memory in redis");
-        await saveMemory();
+    } catch (e) {
+        // Bắt lỗi hết giới hạn Upstash tại đây
+        console.error(`CRITICAL REDIS ERROR: ${e.message}. Switching to in-memory mode.`);
+        isPersistenceFailed = true; // Đánh dấu là không thể dùng Redis
     }
 }
 
 async function saveMemory() {
-    if (!isRedisReady) return;
+    if (!isRedisReady || isPersistenceFailed) return;
     try {
         await redis.set(MEM_KEY, memory);
     } catch (e) {
-        console.error("Failed to save memory to Redis (Hết giới hạn lệnh?):", e.message);
+        console.error("Failed to save memory to Redis (Hết giới hạn lệnh?). Disabling persistence.", e.message);
+        isPersistenceFailed = true; // Tắt persistence nếu gặp lỗi
     }
 }
 
 /* ================ History ================ */
 
 async function getHistory(limit) {
-    if (!isRedisReady) return [];
+    if (!isRedisReady || isPersistenceFailed) return [];
     try {
         // zrevrange (from highest score to lowest)
         return redis.zrevrange(HIS_KEY, 0, limit - 1);
     } catch (e) {
-        console.error("Failed to get history from Redis (Hết giới hạn lệnh?):", e.message);
+        console.error("Failed to get history from Redis (Hết giới hạn lệnh?).", e.message);
         return [];
     }
 }
 
 async function setHistory(data) {
-    if (!isRedisReady) return;
+    if (!isRedisReady || isPersistenceFailed) return;
     try {
         // Use ZADD (Sorted Set) to store history, using timestamp as score to keep order
         const timestamp = Date.now();
@@ -103,15 +115,16 @@ async function setHistory(data) {
         // Trim the list to MAX_HIS to keep memory usage low
         await redis.zremrangebyrank(HIS_KEY, 0, -(MAX_HIS + 1));
     } catch (e) {
-        console.error("Failed to set history to Redis (Hết giới hạn lệnh?):", e.message);
+        console.error("Failed to set history to Redis (Hết giới hạn lệnh?).", e.message);
     }
 }
 
 /* ================ Pattern Learning (APR - Adaptive Pattern Recognition) ================ */
 
+// (Các hàm getPattern, normalizeWeights, updatePatternScore, learn, classifyMarketState, predictNext giữ nguyên)
+
 function getPattern(historyArr, length) {
     if (historyArr.length < length) return null;
-    // Patterns are reversed, so the most recent result is at position 0
     return historyArr.slice(0, length).join("");
 }
 
@@ -133,12 +146,10 @@ function updatePatternScore(patternKey, result) {
     let currentScore = p.score || 1.0;
 
     if (result === 1) {
-        // Win: boost score
         p.wins++;
         currentScore = Math.min(APR_MAX_SCORE, currentScore + APR_BOOST_STEP);
         memory.stats.hits++;
     } else {
-        // Fail: penalize score
         p.fails++;
         currentScore = Math.max(APR_MIN_SCORE, currentScore - APR_PENALTY_STEP);
         memory.stats.fails++;
@@ -149,29 +160,24 @@ function updatePatternScore(patternKey, result) {
 function learn(history) {
     if (history.length < 2) return;
 
-    // The result of the second-most recent entry determines the outcome
-    // The pattern leading to the second-most recent result is the third-most recent onwards
-    const outcome = history[1]; // Result of the history[1] entry
+    const outcome = history[1]; 
     const precedingPattern = history.slice(2, history.length);
 
-    // We learn based on the outcome of the **previous** turn
-    // Patterns are extracted from the list starting from the 3rd element
-    // e.g. [current, prev_result, prev_pattern_3, prev_pattern_2, ...]
     for (let length = 1; length <= 15; length++) {
         const patternStr = getPattern(precedingPattern, length);
         if (!patternStr) continue;
 
         const key = patternStr;
-        const nextOutcome = outcome; // The result *following* this pattern
+        const nextOutcome = outcome; 
 
         if (!memory.patterns[key]) {
             memory.patterns[key] = { wins: 0, fails: 0, score: 1.0, is_vip: false, vip_win_rate: 0.0 };
             memory.stats.learned++;
         }
 
-        if (nextOutcome === 't') { // TÀI
+        if (nextOutcome === 't') { 
             updatePatternScore(key, nextOutcome === 't' ? 1 : 0);
-        } else if (nextOutcome === 'x') { // XỈU
+        } else if (nextOutcome === 'x') { 
             updatePatternScore(key, nextOutcome === 'x' ? 1 : 0);
         }
     }
@@ -179,31 +185,16 @@ function learn(history) {
     memory.stats.total++;
 }
 
-
-/* ================ Engine Logic ================ */
-
-/**
- * Classifies market state for weight adjustment.
- * 1: Tài nhiều hơn Xỉu (T > X)
- * 2: Xỉu nhiều hơn Tài (X > T)
- * 0: Cân bằng (T = X)
- * @param {string[]} history - Array of 't' and 'x' results.
- */
 function classifyMarketState(history) {
     if (history.length === 0) return 0;
     const countT = history.filter(r => r === 't').length;
     const countX = history.filter(r => r === 'x').length;
 
-    if (countT > countX) return 1; // Market favors Tài
-    if (countX > countT) return 2; // Market favors Xỉu
-    return 0; // Balanced
+    if (countT > countX) return 1; 
+    if (countX > countT) return 2; 
+    return 0; 
 }
 
-/**
- * Predicts the next result ('t' or 'x') based on current memory.
- * @param {string[]} currentHistory - Most recent results, e.g., ['t', 'x', 'x']
- * @returns {object} { prediction: 't'|'x', score: number }
- */
 function predictNext(currentHistory) {
     const currentWeights = { t: 0, x: 0 };
     const matchedPatterns = [];
@@ -218,8 +209,6 @@ function predictNext(currentHistory) {
             memory.stats.matched++;
             matchedPatterns.push({ key: patternStr, ...pattern });
 
-            // Apply the pattern's score to the next outcome
-            // Pushing 't' weight
             const t_key = patternStr + 't';
             const x_key = patternStr + 'x';
             const t_pattern = memory.patterns[t_key];
@@ -234,13 +223,11 @@ function predictNext(currentHistory) {
         }
     }
 
-    // Fallback if no patterns matched (highly unlikely)
     if (currentWeights.t === 0 && currentWeights.x === 0) {
         currentWeights.t = 1;
         currentWeights.x = 1;
     }
 
-    // Normalize pattern weights
     const patternTotal = currentWeights.t + currentWeights.x;
     const patternWeightT = currentWeights.t / patternTotal;
     const patternWeightX = currentWeights.x / patternTotal;
@@ -254,8 +241,6 @@ function predictNext(currentHistory) {
         const p = memory.patterns[key];
         if (p.is_vip && key.startsWith(currentHistory.join(""))) {
             vipMatches++;
-            // If the current history is a prefix of a VIP pattern
-            // Apply the VIP win rate directly
             if (p.vip_win_rate > 0.5) {
                 vipWeightT += p.vip_win_rate;
             } else {
@@ -270,9 +255,8 @@ function predictNext(currentHistory) {
         vipWeightX = vipWeightX / vipTotal;
         memory.stats.vip = vipMatches;
     } else {
-        // If no VIP match, distribute the influence to the base engine
-        vipWeightT = 0.5; // Neutral
-        vipWeightX = 0.5; // Neutral
+        vipWeightT = 0.5; 
+        vipWeightX = 0.5; 
     }
 
     // --- 3. Final Weighted Prediction ---
@@ -296,15 +280,12 @@ function predictNext(currentHistory) {
 
 /* ================ API Polling and Learning ================ */
 
-// Đã sửa lại cơ chế polling để dùng setTimeout đệ quy, ổn định hơn setInterval
 async function pollApiAndLearn() {
     try {
         const response = await axios.get(API_URL);
         const data = response.data.data;
         if (!data || data.length === 0) return;
 
-        // The data is an array of objects like { betType: 1 or 2 }
-        // 1: Tài (t), 2: Xỉu (x)
         const results = data.map(item => item.betType === 1 ? 't' : 'x');
 
         // 1. Learn from previous results
@@ -10328,12 +10309,6 @@ const VIP_PATTERNS_TEXT = `
 10000. TXXTTTXXTTTXTT - T
 `;
 
-/**
- * Loads VIP patterns from a text block and injects them into the memory.
- * They are marked with is_vip: true.
- * @param {string} text - Text block containing patterns and win rates (e.g., 't:0.60;').
- * @returns {number} Number of VIP patterns loaded.
- */
 function loadVipFromTextAndInject(text) {
     let count = 0;
     const lines = text.trim().split(';');
@@ -10351,7 +10326,6 @@ function loadVipFromTextAndInject(text) {
                 memory.patterns[key] = { wins: 0, fails: 0, score: 1.0, is_vip: true, vip_win_rate: rate };
                 memory.stats.learned++;
             } else {
-                // Update existing pattern
                 memory.patterns[key].is_vip = true;
                 memory.patterns[key].vip_win_rate = rate;
             }
@@ -10371,10 +10345,11 @@ app.get("/", (req, res) => {
 
 // Main prediction endpoint
 app.get("/api/predict", async (req, res) => {
-    const history = await getHistory(15); // Get the last 15 results
+    // Sẽ trả về lịch sử trống nếu Redis bị lỗi
+    const history = await getHistory(15); 
     const prediction = predictNext(history);
     const topPatterns = Object.entries(memory.patterns)
-        .filter(([k, v]) => !v.is_vip) // Filter out pure VIP patterns
+        .filter(([k, v]) => !v.is_vip) 
         .sort(([, a], [, b]) => b.score - a.score)
         .map(([key, value]) => ({ key, score: value.score, wins: value.wins, fails: value.fails }));
 
@@ -10389,8 +10364,10 @@ app.get("/api/predict", async (req, res) => {
             fails: memory.stats.fails,
             vipMatches: prediction.vipMatches,
             marketState: classifyMarketState(await getHistory(200)),
+            // Thêm trạng thái persistence để bạn dễ kiểm tra
+            is_persistence_active: isRedisReady && !isPersistenceFailed
         },
-        topPatterns: topPatterns.slice(0, 60), // Return top 60 non-VIP patterns
+        topPatterns: topPatterns.slice(0, 60), 
     });
 });
 
@@ -10415,7 +10392,7 @@ app.get("/admin/reload-vip", async (req, res) => {
 
 /* Admin: wipe history (danger) */
 app.post("/admin/wipe-history", async (req, res) => {
-    if (!isRedisReady) return res.status(400).json({ error: "Redis is not active." });
+    if (!isRedisReady || isPersistenceFailed) return res.status(400).json({ error: "Redis is not active or connection failed." });
     try {
         await redis.del(HIS_KEY);
         res.json({ ok: true });
@@ -10429,39 +10406,43 @@ process.on("SIGTERM", async () => { await persistAll(); process.exit(0); });
 
 /* ================ API Poller (REVISED) ================ */
 
-/**
- * Sử dụng setTimeout đệ quy để đảm bảo request tiếp theo
- * chỉ chạy sau khi request trước hoàn tất và đợi hết interval.
- */
 async function pollApiLoop() {
     try {
         await pollApiAndLearn();
     } catch (e) {
-        // Log lỗi nhưng không làm dừng vòng lặp polling
         console.error("Error during API poll loop:", e.message || e);
     } finally {
-        // Luôn luôn thiết lập thời gian chờ cho lần thăm dò tiếp theo
         setTimeout(pollApiLoop, POLL_INTERVAL);
     }
 }
 
 /* ================ INIT ================ */
 (async () => {
-    await loadMemory();
-    // inject VIP from embedded text
+    // Sửa lỗi: Cố gắng load memory, nếu lỗi thì chuyển sang in-memory
+    await loadMemory(); 
+    
+    // Nếu loadMemory không crash (do cơ chế try/catch mới) và không gặp lỗi persistence, 
+    // thì tiếp tục init như bình thường
+    
     loadVipFromTextAndInject(VIP_PATTERNS_TEXT);
-    // seed history if empty
+    
     const existing = await getHistory(1);
     if (!existing || existing.length === 0) {
         console.log("History is empty, fetching initial data...");
-        await pollApiAndLearn(); // Initial fetch
+        // Cố gắng fetch và save (sẽ tự động disable save nếu redis fail)
+        await pollApiAndLearn(); 
     }
 
-    // Bắt đầu vòng lặp polling API
     pollApiLoop();
 
-    // Start server
     app.listen(PORT, () => {
         console.log(`Server running on port ${PORT}`);
+        if (isPersistenceFailed) {
+            console.warn("**************************************************");
+            console.warn("REDIS PERSISTENCE FAILED! Running in In-Memory mode.");
+            console.warn("Patterns/History will be lost on next restart/deploy.");
+            console.warn("Check Upstash (hết giới hạn) hoặc nâng cấp gói.");
+            console.warn("**************************************************");
+        }
     });
 })();
