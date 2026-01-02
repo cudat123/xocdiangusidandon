@@ -1,40 +1,34 @@
-import express from "express";
-import axios from "axios";
-import cors from "cors";
+const express = require("express");
+const axios = require("axios");
 
 const app = express();
-app.use(cors());
+const PORT = 3000;
 
-app.get("/api/sun", async (req, res) => {
+const URL = "https://toolgametx.space/sun.php";
+
+app.get("/api/sunwin", async (req, res) => {
   try {
-    const response = await axios.get(
-      "https://toolgametx.space/sun.php",
-      {
-        params: { _: Date.now() },
-        headers: {
-          "X-Requested-With": "XMLHttpRequest",
-          "User-Agent":
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
-          "Accept": "application/json, text/plain, */*",
-          "Referer": "https://toolgametx.space/",
-        },
-        timeout: 10000,
-      }
-    );
-
-    res.json({
-      success: true,
-      data: response.data,
+    const response = await axios.get(URL, {
+      headers: {
+        "X-Requested-With": "XMLHttpRequest",
+        "User-Agent": "Mozilla/5.0",
+        "Accept": "application/json"
+      },
+      timeout: 10000
     });
+
+    // trả thẳng JSON gốc
+    res.json(response.data);
+
   } catch (err) {
+    console.error("Lỗi:", err.message);
     res.status(500).json({
-      success: false,
-      error: err.message,
+      error: "Không gọi được sun.php",
+      detail: err.message
     });
   }
 });
 
-const PORT = process.env.PORT || 3000;
-app.listen(PORT, () =>
-  console.log("Proxy running on port", PORT)
-);
+app.listen(PORT, () => {
+  console.log(`OK → http://localhost:${PORT}/api/sunwin`);
+});
